@@ -41,7 +41,7 @@ class NodeAgentService:
             base_url=settings.control_plane_url,
             hotkey=settings.miner_hotkey,
             auth_secret=settings.miner_auth_secret,
-            hotkey_uri=settings.hotkey_uri,
+            hotkey_wallet_path=settings.hotkey_wallet_path,
             auth_mode=settings.auth_mode,
         )
 

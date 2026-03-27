@@ -68,8 +68,9 @@ class Settings(BaseModel):
 
     # Auth mode: "hotkey" (ed25519, production) or "hmac" (shared secret, dev)
     auth_mode: str = "hmac"
-    # Bittensor hotkey seed URI for ed25519 signing (e.g. "//Alice" or wallet seed)
-    hotkey_uri: str | None = None
+    # Path to Bittensor hotkey wallet file for ed25519 signing
+    # (~/.bittensor/wallets/{coldkey_name}/hotkeys/{hotkey_name})
+    hotkey_wallet_path: str | None = None
 
     # Auth (optional, for route protection)
     agent_auth_secret: str | None = None
@@ -111,7 +112,7 @@ def load_settings() -> Settings:
         ssh_port_range_start=int(os.getenv("GREENFERENCE_SSH_PORT_RANGE_START", "30000")),
         ssh_port_range_end=int(os.getenv("GREENFERENCE_SSH_PORT_RANGE_END", "31000")),
         auth_mode=os.getenv("GREENFERENCE_AUTH_MODE", "hmac"),
-        hotkey_uri=os.getenv("GREENFERENCE_HOTKEY_URI") or None,
+        hotkey_wallet_path=os.getenv("GREENFERENCE_HOTKEY_WALLET_PATH") or None,
         agent_auth_secret=os.getenv("GREENFERENCE_AGENT_AUTH_SECRET") or None,
         inference_auth_secret=os.getenv("GREENFERENCE_INFERENCE_AUTH_SECRET") or None,
         compute_auth_secret=os.getenv("GREENFERENCE_COMPUTE_AUTH_SECRET") or None,
