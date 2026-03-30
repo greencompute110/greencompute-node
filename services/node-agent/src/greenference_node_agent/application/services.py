@@ -403,6 +403,25 @@ class NodeAgentService:
             logger.exception("failed to report failure for %s", runtime.deployment_id)
 
     def _terminate_runtime(self, runtime: UnifiedRuntimeRecord, reason: str = "terminated") -> None:
+        # Stop the actual backend workload
+        kind = runtime.workload_kind
+        try:
+            if kind in (WorkloadKind.INFERENCE, "inference") and runtime.process_id:
+                self.inference_backend.stop_runtime(runtime)
+                if runtime.runtime_dir:
+                    self.artifact_store.delete_runtime_dir(runtime.runtime_dir)
+                if runtime.staged_artifact_path:
+                    self.artifact_store.delete_staged_artifact(runtime.staged_artifact_path)
+            elif kind in (WorkloadKind.POD, "pod") and runtime.container_id:
+                self.pod_backend.stop_pod(runtime)
+                volume = self._volume_records.pop(runtime.deployment_id, None)
+                if volume:
+                    self.volume_manager.delete_volume(volume)
+            elif kind in (WorkloadKind.VM, "vm") and runtime.vm_id:
+                self.vm_backend.stop_vm(runtime)
+        except Exception:
+            logger.exception("backend cleanup failed for %s", runtime.deployment_id)
+
         runtime = runtime.model_copy(update={
             "status": "terminated",
             "current_stage": "terminated",
