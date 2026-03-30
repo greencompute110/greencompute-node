@@ -132,6 +132,19 @@ def get_runtime(
     return runtime.model_dump(mode="json")
 
 
+@router.post("/agent/v1/deployments/{deployment_id}/chat/completions")
+async def chat_completions(
+    deployment_id: str,
+    payload: dict,
+    x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
+) -> dict:
+    validate_optional_auth(x_agent_auth, _cfg().agent_auth_secret)
+    result = _svc().invoke_inference(deployment_id, payload)
+    if result is None:
+        raise HTTPException(status_code=404, detail="inference deployment not found or not ready")
+    return result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+
+
 @router.get("/agent/v1/deployments/{deployment_id}/ssh")
 def get_ssh_access(
     deployment_id: str,

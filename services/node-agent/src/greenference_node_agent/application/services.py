@@ -185,22 +185,73 @@ class NodeAgentService:
 
     def _start_inference_runtime(self, runtime: UnifiedRuntimeRecord, workload: WorkloadSpec) -> None:
         """Start an inference workload (model serving)."""
-        logger.info("starting inference runtime for %s (model: %s)", runtime.deployment_id, workload.runtime.model_identifier)
+        model_id = workload.runtime.model_identifier if workload.runtime else workload.image
+        logger.info("starting inference runtime for %s (model: %s)", runtime.deployment_id, model_id)
+
+        # Stage artifact
+        build_id = workload.metadata.get("build_id", runtime.deployment_id)
+        image = workload.image or "unknown"
+        artifact_uri = workload.metadata.get("artifact_uri", f"local://{image}")
+        artifact_digest = workload.metadata.get("artifact_digest", f"sha256:{runtime.deployment_id[:16]}")
+        runtime_manifest = {
+            "runtime_kind": workload.metadata.get("runtime_kind", "hf-causal-lm"),
+            "model_identifier": model_id,
+            "model_revision": workload.metadata.get("model_revision"),
+            "tokenizer_identifier": workload.metadata.get("tokenizer_identifier"),
+            "seed_corpus": workload.metadata.get("seed_corpus", [
+                f"{image} serves greenference inference requests",
+                "miners keep deployments healthy with recovery failover and streaming completions",
+            ]),
+        }
+        payload = {
+            "build_id": build_id,
+            "image": image,
+            "runtime_manifest": runtime_manifest,
+        }
+
+        try:
+            artifact = self.artifact_store.stage_artifact(
+                deployment_id=runtime.deployment_id,
+                build_id=build_id,
+                image=image,
+                artifact_uri=artifact_uri,
+                artifact_digest=artifact_digest,
+                registry_manifest_uri=workload.metadata.get("registry_manifest_uri"),
+                context_manifest_uri=workload.metadata.get("context_manifest_uri"),
+                dockerfile_path=workload.metadata.get("dockerfile_path"),
+                payload=payload,
+            )
+        except InferenceRuntimeError:
+            logger.exception("artifact staging failed for %s", runtime.deployment_id)
+            self._fail_runtime(runtime, "artifact staging failed")
+            return
+
+        # Prepare runtime directory
+        runtime_dir = self.artifact_store.runtime_dir(runtime.deployment_id)
         runtime = runtime.model_copy(update={
             "status": "starting",
             "current_stage": "start_inference_backend",
-            "model_identifier": workload.runtime.model_identifier,
-            "image": workload.image,
+            "model_identifier": model_id,
+            "image": image,
             "runtime_mode": self.settings.inference_backend,
+            "staged_artifact_path": artifact.staged_artifact_path,
+            "runtime_dir": runtime_dir,
+            "updated_at": _utcnow(),
         })
         self.repository.upsert_runtime(runtime)
 
-        # TODO: Phase 2 full implementation — pull artifact, start subprocess/K8s,
-        # health check, mark ready. For now, mark ready with stub endpoint.
+        # Start inference process
+        try:
+            runtime = self.inference_backend.start_runtime(runtime, artifact)
+        except InferenceRuntimeError as exc:
+            logger.exception("inference start failed for %s", runtime.deployment_id)
+            self._fail_runtime(runtime, str(exc))
+            return
+
         runtime = runtime.model_copy(update={
             "status": "ready",
             "current_stage": "ready",
-            "endpoint": f"{self.settings.miner_api_base_url}/deployments/{runtime.deployment_id}",
+            "endpoint": runtime.runtime_url or f"{self.settings.miner_api_base_url}/deployments/{runtime.deployment_id}",
             "updated_at": _utcnow(),
         })
         self.repository.upsert_runtime(runtime)
@@ -307,6 +358,19 @@ class NodeAgentService:
             return None
         private_key = runtime.metadata.get("ssh_private_key") if include_private_key else None
         return build_ssh_access(runtime, include_private_key=include_private_key, private_key=private_key)
+
+    def invoke_inference(self, deployment_id: str, payload: Any) -> Any:
+        """Invoke chat completions on an inference runtime."""
+        from greenference_protocol import ChatCompletionRequest
+        runtime = self.repository.get_runtime(deployment_id)
+        if runtime is None:
+            return None
+        if runtime.workload_kind not in (WorkloadKind.INFERENCE, "inference"):
+            return None
+        if runtime.status != "ready":
+            return None
+        request = ChatCompletionRequest(**payload) if isinstance(payload, dict) else payload
+        return self.inference_backend.invoke(runtime, request)
 
     # --- Runtime lifecycle helpers ---
 
