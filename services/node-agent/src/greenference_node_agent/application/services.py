@@ -26,6 +26,7 @@ from greenference_protocol import (
 from greenference_node_agent.config import Settings
 from greenference_node_agent.domain.inference import (
     ArtifactBundle,
+    DockerInferenceBackend,
     InferenceRuntimeError,
     LocalArtifactInferenceBackend,
     ProcessInferenceBackend,
@@ -68,8 +69,10 @@ class NodeAgentService:
 
         # Inference backend
         fallback = LocalArtifactInferenceBackend()
-        if settings.inference_backend == "process":
-            self.inference_backend: ProcessInferenceBackend | LocalArtifactInferenceBackend = ProcessInferenceBackend(fallback_backend=fallback)
+        if settings.inference_backend == "docker":
+            self.inference_backend: DockerInferenceBackend | ProcessInferenceBackend | LocalArtifactInferenceBackend = DockerInferenceBackend()
+        elif settings.inference_backend == "process":
+            self.inference_backend = ProcessInferenceBackend(fallback_backend=fallback)
         else:
             self.inference_backend = fallback
         self.artifact_store = StagedArtifactStore(settings.artifact_cache_dir)
@@ -409,7 +412,7 @@ class NodeAgentService:
         # Stop the actual backend workload
         kind = runtime.workload_kind
         try:
-            if kind in (WorkloadKind.INFERENCE, "inference") and runtime.process_id:
+            if kind in (WorkloadKind.INFERENCE, "inference") and (runtime.process_id or runtime.container_id):
                 self.inference_backend.stop_runtime(runtime)
                 if runtime.runtime_dir:
                     self.artifact_store.delete_runtime_dir(runtime.runtime_dir)

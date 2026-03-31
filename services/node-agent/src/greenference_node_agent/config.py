@@ -53,7 +53,7 @@ class Settings(BaseModel):
     # Backends
     pod_backend: str = "process"  # process | stub | k8s
     vm_backend: str = "stub"  # stub | firecracker
-    inference_backend: str = "process"  # process | k8s
+    inference_backend: str = "docker"  # docker | process | fallback
     allow_runtime_fallback: bool = False
 
     # Workload kinds this node supports

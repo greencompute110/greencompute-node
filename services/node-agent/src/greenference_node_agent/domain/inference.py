@@ -1,8 +1,10 @@
-"""Inference runtime backends — ProcessInferenceBackend and StagedArtifactStore."""
+"""Inference runtime backends — ProcessInferenceBackend, DockerInferenceBackend, and StagedArtifactStore."""
 
 from __future__ import annotations
 
 import json
+import logging
+import os
 import socket
 import subprocess
 import sys
@@ -18,6 +20,8 @@ from pydantic import BaseModel, Field
 
 from greenference_protocol import ChatCompletionRequest, ChatCompletionResponse, UnifiedRuntimeRecord
 from greenference_node_agent.domain.model_backend import ModelBackendError, create_text_generation_backend
+
+logger = logging.getLogger(__name__)
 
 
 def utcnow() -> datetime:
@@ -455,6 +459,263 @@ class ProcessInferenceBackend(InferenceBackend):
                 failure_class=failure_class,
                 stage="health_check" if path == "/healthz" else "invoke_inference",
             ) from exc
+
+
+class DockerInferenceBackend(InferenceBackend):
+    """Launches inference as a Docker container running vLLM (or compatible OpenAI server)."""
+
+    def __init__(
+        self,
+        *,
+        backend_name: str = "docker-vllm-backend",
+        health_timeout_seconds: float = 300.0,
+        default_image: str = "vllm/vllm-openai:latest",
+        gpu_memory_utilization: float = 0.90,
+    ) -> None:
+        self.backend_name = backend_name
+        self.health_timeout_seconds = health_timeout_seconds
+        self.default_image = default_image
+        self.gpu_memory_utilization = gpu_memory_utilization
+
+    def start_runtime(
+        self,
+        runtime: UnifiedRuntimeRecord,
+        artifact: ArtifactBundle,
+    ) -> UnifiedRuntimeRecord:
+        model_id = runtime.model_identifier or artifact.image
+        port = _choose_free_port()
+        container_name = f"greenference-inf-{runtime.deployment_id[:12]}"
+        image = artifact.payload.get("docker_image") or self.default_image
+
+        cmd: list[str] = [
+            "docker", "run", "-d",
+            "--name", container_name,
+            "--gpus", "all",
+            "--shm-size", "8g",
+            "-p", f"{port}:8000",
+        ]
+
+        # Pass HuggingFace token if available
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN", "")
+        if hf_token:
+            cmd += ["-e", f"HUGGING_FACE_HUB_TOKEN={hf_token}"]
+
+        # Mount HuggingFace cache for faster repeated loads
+        hf_cache = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+        if Path(hf_cache).exists():
+            cmd += ["-v", f"{hf_cache}:/root/.cache/huggingface"]
+
+        cmd.append(image)
+
+        # vLLM serve arguments
+        cmd += [
+            "--model", model_id,
+            "--host", "0.0.0.0",
+            "--port", "8000",
+            "--gpu-memory-utilization", str(self.gpu_memory_utilization),
+        ]
+
+        # Optional: tensor parallel for multi-GPU
+        tp_size = artifact.payload.get("tensor_parallel_size")
+        if tp_size and int(tp_size) > 1:
+            cmd += ["--tensor-parallel-size", str(tp_size)]
+
+        # Optional: max model length
+        max_model_len = artifact.payload.get("max_model_len")
+        if max_model_len:
+            cmd += ["--max-model-len", str(max_model_len)]
+
+        logger.info("starting vLLM container for %s: model=%s image=%s port=%d", runtime.deployment_id, model_id, image, port)
+
+        try:
+            result = subprocess.run(  # noqa: S603
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120.0,
+            )
+            if result.returncode != 0:
+                raise InferenceRuntimeError(
+                    f"docker run failed: {result.stderr}",
+                    failure_class="runtime_start_failure",
+                    stage="start_inference_backend",
+                )
+            container_id = result.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            raise InferenceRuntimeError(
+                f"docker not available: {exc}",
+                failure_class="runtime_start_failure",
+                stage="start_inference_backend",
+            ) from exc
+
+        runtime_url = f"http://127.0.0.1:{port}"
+        runtime = runtime.model_copy(update={
+            "container_id": container_id,
+            "runtime_url": runtime_url,
+            "process_id": None,
+            "runtime_mode": "docker",
+            "backend_name": self.backend_name,
+            "model_identifier": model_id,
+            "metadata": {
+                **runtime.metadata,
+                "container_name": container_name,
+                "docker_image": image,
+                "runtime_port": port,
+                "backend_started": True,
+                "started_at": utcnow().isoformat(),
+            },
+            "updated_at": utcnow(),
+        })
+
+        # vLLM takes time to load — wait for health
+        self._wait_for_health(runtime)
+        return runtime
+
+    def stop_runtime(self, runtime: UnifiedRuntimeRecord) -> UnifiedRuntimeRecord:
+        if runtime.container_id:
+            try:
+                subprocess.run(  # noqa: S603
+                    ["docker", "rm", "-f", runtime.container_id],  # noqa: S607
+                    capture_output=True,
+                    timeout=30.0,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+        return runtime.model_copy(update={
+            "container_id": None,
+            "runtime_url": None,
+            "metadata": {
+                **runtime.metadata,
+                "backend_started": False,
+                "terminated_at": utcnow().isoformat(),
+            },
+            "updated_at": utcnow(),
+        })
+
+    def health(self, runtime: UnifiedRuntimeRecord) -> dict[str, Any]:
+        if runtime.runtime_url is None:
+            return {"status": "not_started", "healthy": False}
+        try:
+            target = f"{runtime.runtime_url}/health"
+            req = request.Request(target, method="GET")
+            with request.urlopen(req, timeout=5.0) as resp:  # noqa: S310
+                return {"status": "ok", "healthy": True, "backend": self.backend_name}
+        except (HTTPError, URLError, TimeoutError):
+            return {"status": "unhealthy", "healthy": False}
+
+    def invoke(
+        self,
+        runtime: UnifiedRuntimeRecord,
+        payload: ChatCompletionRequest,
+    ) -> ChatCompletionResponse:
+        if runtime.runtime_url is None:
+            raise InferenceRuntimeError(
+                "runtime URL missing",
+                failure_class="inference_execution_failure",
+                stage="invoke_inference",
+            )
+        target = f"{runtime.runtime_url}/v1/chat/completions"
+        body = json.dumps(payload.model_dump(mode="json")).encode()
+        req = request.Request(target, data=body, method="POST")
+        req.add_header("content-type", "application/json")
+        try:
+            with request.urlopen(req, timeout=60.0) as resp:  # noqa: S310
+                data = json.loads(resp.read().decode())
+            # vLLM returns OpenAI-compatible response — extract content
+            content = ""
+            choices = data.get("choices", [])
+            if choices:
+                message = choices[0].get("message", {})
+                content = message.get("content", "")
+            return ChatCompletionResponse(
+                model=data.get("model", payload.model),
+                content=content,
+                deployment_id=runtime.deployment_id,
+                routed_hotkey=runtime.hotkey,
+            )
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise InferenceRuntimeError(
+                f"inference request failed: {exc}",
+                failure_class="inference_execution_failure",
+                stage="invoke_inference",
+            ) from exc
+
+    def stream(
+        self,
+        runtime: UnifiedRuntimeRecord,
+        payload: ChatCompletionRequest,
+    ) -> Iterator[str]:
+        if runtime.runtime_url is None:
+            raise InferenceRuntimeError(
+                "runtime URL missing during stream",
+                failure_class="inference_execution_failure",
+                stage="stream_inference",
+            )
+        target = f"{runtime.runtime_url}/v1/chat/completions"
+        stream_payload = payload.model_dump(mode="json")
+        stream_payload["stream"] = True
+        body = json.dumps(stream_payload).encode()
+        req = request.Request(target, data=body, method="POST")
+        req.add_header("content-type", "application/json")
+        try:
+            with request.urlopen(req, timeout=60.0) as resp:  # noqa: S310
+                while True:
+                    line = resp.readline()
+                    if not line:
+                        break
+                    yield line.decode()
+        except (HTTPError, URLError, TimeoutError) as exc:
+            raise InferenceRuntimeError(
+                f"stream request failed: {exc}",
+                failure_class="inference_execution_failure",
+                stage="stream_inference",
+            ) from exc
+
+    def _wait_for_health(self, runtime: UnifiedRuntimeRecord) -> None:
+        """Wait for vLLM to become healthy. Model loading can take minutes."""
+        deadline = time.time() + self.health_timeout_seconds
+        last_error: str | None = None
+        check_interval = 2.0  # vLLM takes a while, no need to poll fast
+        while time.time() < deadline:
+            # First check container is still running
+            if runtime.container_id:
+                try:
+                    result = subprocess.run(  # noqa: S603
+                        ["docker", "inspect", "--format", "{{.State.Status}}", runtime.container_id],  # noqa: S607
+                        capture_output=True,
+                        text=True,
+                        timeout=5.0,
+                    )
+                    if result.returncode == 0 and result.stdout.strip() == "exited":
+                        logs = subprocess.run(  # noqa: S603
+                            ["docker", "logs", "--tail", "20", runtime.container_id],  # noqa: S607
+                            capture_output=True,
+                            text=True,
+                            timeout=5.0,
+                        )
+                        raise InferenceRuntimeError(
+                            f"container exited prematurely: {logs.stderr or logs.stdout}",
+                            failure_class="runtime_start_failure",
+                            stage="health_check",
+                        )
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+            # Then check HTTP health
+            try:
+                target = f"{runtime.runtime_url}/health"
+                req = request.Request(target, method="GET")
+                with request.urlopen(req, timeout=5.0) as resp:  # noqa: S310
+                    if resp.status == 200:
+                        logger.info("vLLM healthy for %s after %.0fs", runtime.deployment_id, time.time() - (deadline - self.health_timeout_seconds))
+                        return
+            except (HTTPError, URLError, TimeoutError) as exc:
+                last_error = str(exc)
+            time.sleep(check_interval)
+        raise InferenceRuntimeError(
+            f"vLLM health check timed out after {self.health_timeout_seconds}s: {last_error or 'no response'}",
+            failure_class="health_check_failure",
+            stage="health_check",
+        )
 
 
 class StagedArtifactStore:
