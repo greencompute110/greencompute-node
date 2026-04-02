@@ -1,29 +1,30 @@
 services:
   node-agent:
     image: python:3.12-slim
-    working_dir: /workspace/greenference-node
+    working_dir: /app/node
     volumes:
-      - /workspace:/workspace
+      - ./:/app/node
+      - ${PROTOCOL_DIR:-../../greenference/protocol}:/app/protocol
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${BITTENSOR_WALLET_DIR:-/root/.bittensor}:/root/.bittensor:ro
+      - ${BITTENSOR_WALLET_DIR:-~/.bittensor}:/root/.bittensor:ro
       - node-volumes:/tmp/greenference-node-volumes
       - node-artifacts:/tmp/greenference-node-artifacts
-      - ${HF_HOME:-/root/.cache/huggingface}:/root/.cache/huggingface
+      - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
     environment:
       GREENFERENCE_ENABLE_BACKGROUND_WORKERS: "true"
       GREENFERENCE_WORKER_POLL_INTERVAL_SECONDS: "${WORKER_POLL_INTERVAL_SECONDS:-1.0}"
       GREENFERENCE_BOOTSTRAP_MINER: "true"
-      GREENFERENCE_CONTROL_PLANE_URL: "${GREENFERENCE_CONTROL_PLANE_URL:-http://127.0.0.1:28001}"
+      GREENFERENCE_CONTROL_PLANE_URL: "${GREENFERENCE_CONTROL_PLANE_URL}"
       GREENFERENCE_MINER_HOTKEY: "${GREENFERENCE_MINER_HOTKEY}"
-      GREENFERENCE_MINER_PAYOUT_ADDRESS: "${GREENFERENCE_MINER_PAYOUT_ADDRESS}"
+      GREENFERENCE_MINER_PAYOUT_ADDRESS: "${GREENFERENCE_MINER_PAYOUT_ADDRESS:-}"
       GREENFERENCE_MINER_AUTH_SECRET: "${GREENFERENCE_MINER_AUTH_SECRET:-greenference-node-local-secret}"
       GREENFERENCE_MINER_API_BASE_URL: "${GREENFERENCE_MINER_API_BASE_URL:-http://127.0.0.1:8007}"
-      GREENFERENCE_MINER_VALIDATOR_URL: "${GREENFERENCE_MINER_VALIDATOR_URL:-http://127.0.0.1:28002}"
-      GREENFERENCE_MINER_NODE_ID: "${GREENFERENCE_MINER_NODE_ID:-node-local}"
+      GREENFERENCE_MINER_VALIDATOR_URL: "${GREENFERENCE_MINER_VALIDATOR_URL}"
+      GREENFERENCE_MINER_NODE_ID: "${GREENFERENCE_MINER_NODE_ID:-node-01}"
       # Hardware
-      GREENFERENCE_GPU_MODEL: "${GREENFERENCE_GPU_MODEL:-a100}"
+      GREENFERENCE_GPU_MODEL: "${GREENFERENCE_GPU_MODEL:-rtx4090}"
       GREENFERENCE_GPU_COUNT: "${GREENFERENCE_GPU_COUNT:-1}"
-      GREENFERENCE_VRAM_GB_PER_GPU: "${GREENFERENCE_VRAM_GB_PER_GPU:-80}"
+      GREENFERENCE_VRAM_GB_PER_GPU: "${GREENFERENCE_VRAM_GB_PER_GPU:-24}"
       GREENFERENCE_CPU_CORES: "${GREENFERENCE_CPU_CORES:-32}"
       GREENFERENCE_MEMORY_GB: "${GREENFERENCE_MEMORY_GB:-128}"
       GREENFERENCE_PERFORMANCE_SCORE: "${GREENFERENCE_PERFORMANCE_SCORE:-1.0}"
@@ -38,22 +39,22 @@ services:
       GREENFERENCE_INFERENCE_BACKEND: "${GREENFERENCE_INFERENCE_BACKEND:-docker}"
       # HuggingFace (for vLLM model downloads)
       HF_TOKEN: "${HF_TOKEN:-}"
-      HF_HOME: "${HF_HOME:-/root/.cache/huggingface}"
+      HF_HOME: /root/.cache/huggingface
       # Security
       GREENFERENCE_SECURITY_TIER: "${GREENFERENCE_SECURITY_TIER:-standard}"
       GREENFERENCE_ATTESTATION_ENABLED: "${GREENFERENCE_ATTESTATION_ENABLED:-false}"
       # Workload kinds
       GREENFERENCE_SUPPORTED_WORKLOAD_KINDS: "${GREENFERENCE_SUPPORTED_WORKLOAD_KINDS:-inference,pod,vm}"
       # SSH
-      GREENFERENCE_SSH_HOST: "${GREENFERENCE_SSH_HOST:-127.0.0.1}"
+      GREENFERENCE_SSH_HOST: "${GREENFERENCE_SSH_HOST:-0.0.0.0}"
       GREENFERENCE_SSH_PORT_RANGE_START: "${GREENFERENCE_SSH_PORT_RANGE_START:-30000}"
       GREENFERENCE_SSH_PORT_RANGE_END: "${GREENFERENCE_SSH_PORT_RANGE_END:-31000}"
       # Persistence
-      GREENFERENCE_RUNTIME_STATE_PATH: "/tmp/greenference-node-runtime-state.json"
-      GREENFERENCE_VOLUME_BASE_DIR: "/tmp/greenference-node-volumes"
-      GREENFERENCE_ARTIFACT_CACHE_DIR: "/tmp/greenference-node-artifacts"
+      GREENFERENCE_RUNTIME_STATE_PATH: /tmp/greenference-node-runtime-state.json
+      GREENFERENCE_VOLUME_BASE_DIR: /tmp/greenference-node-volumes
+      GREENFERENCE_ARTIFACT_CACHE_DIR: /tmp/greenference-node-artifacts
       # PYTHONPATH
-      PYTHONPATH: /workspace/greenference/protocol/src:/workspace/greenference-node/services/node-agent/src
+      PYTHONPATH: /app/protocol/src:/app/node/services/node-agent/src
     command: >
       sh -lc "apt-get update -qq && apt-get install -y -qq docker.io openssh-client >/dev/null 2>&1;
       pip install -q fastapi uvicorn pydantic substrate-interface &&
