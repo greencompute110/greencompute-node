@@ -72,8 +72,10 @@ class ProcessPodBackend(PodBackend):
         ]
 
         # SSH port forwarding — let Docker pick a free host port to avoid races
+        # Use 2222 as container port (linuxserver/openssh-server default), fallback to 22
+        container_ssh_port = runtime.metadata.get("container_ssh_port", 2222)
         if runtime.ssh_port:
-            cmd += ["-p", f"0.0.0.0::22"]
+            cmd += ["-p", f"0.0.0.0::{container_ssh_port}"]
 
         # Volume mount
         if runtime.volume_path:
@@ -92,10 +94,12 @@ class ProcessPodBackend(PodBackend):
         for key, value in env_vars.items():
             cmd += ["-e", f"{key}={value}"]
 
-        # SSH authorized keys
+        # SSH authorized keys — set both common env vars for compatibility
         ssh_public_keys: list[str] = runtime.metadata.get("ssh_public_keys", [])
         if ssh_public_keys:
-            cmd += ["-e", f"AUTHORIZED_KEYS={chr(10).join(ssh_public_keys)}"]
+            keys_str = chr(10).join(ssh_public_keys)
+            cmd += ["-e", f"AUTHORIZED_KEYS={keys_str}"]
+            cmd += ["-e", f"PUBLIC_KEY={keys_str}"]
 
         cmd.append(image)
 
@@ -125,7 +129,7 @@ class ProcessPodBackend(PodBackend):
         if runtime.ssh_port:
             try:
                 port_result = subprocess.run(  # noqa: S603
-                    ["docker", "port", container_id, "22"],  # noqa: S607
+                    ["docker", "port", container_id, str(container_ssh_port)],  # noqa: S607
                     capture_output=True,
                     text=True,
                     timeout=5.0,

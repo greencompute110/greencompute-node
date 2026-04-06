@@ -362,8 +362,10 @@ class NodeAgentService:
             if not self.pod_backend.wait_for_ready(runtime, timeout_seconds=30.0):
                 logger.warning("pod SSH not reachable for %s after 30s, marking ready anyway", runtime.deployment_id)
 
+        # Build endpoint with SSH connection details
+        ssh_endpoint = f"ssh://{runtime.ssh_username}@{runtime.ssh_host}:{runtime.ssh_port}"
         runtime = runtime.model_copy(update={
-            "endpoint": f"{s.miner_api_base_url}/deployments/{runtime.deployment_id}",
+            "endpoint": ssh_endpoint,
         })
         self.repository.upsert_runtime(runtime)
         self._report_deployment_ready(runtime)
@@ -430,6 +432,7 @@ class NodeAgentService:
                 deployment_id=runtime.deployment_id,
                 state=DeploymentState.READY,
                 endpoint=runtime.endpoint,
+                ssh_private_key=runtime.metadata.get("ssh_private_key"),
                 ready_instances=1,
             ))
         except ControlPlaneHTTPError:
