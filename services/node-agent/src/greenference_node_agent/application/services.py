@@ -145,11 +145,25 @@ class NodeAgentService:
         for lease in leases:
             existing = self.repository.get_runtime(lease.deployment_id)
             if existing is not None:
-                continue  # Already tracked
+                # If the runtime was saved but never reached ready/failed, retry it
+                if existing.status in ("accepted", "starting"):
+                    logger.info("retrying stuck runtime %s (status=%s)", lease.deployment_id, existing.status)
+                    self.repository.remove_runtime(lease.deployment_id)
+                else:
+                    continue  # Already completed (ready/failed/terminated)
             try:
                 self._reconcile_workload(lease)
             except Exception:
                 logger.exception("failed to reconcile lease %s", lease.deployment_id)
+                # Report failure to control plane so deployment doesn't stay SCHEDULED forever
+                try:
+                    self.control_plane.update_deployment_status(DeploymentStatusUpdate(
+                        deployment_id=lease.deployment_id,
+                        state=DeploymentState.FAILED,
+                        error="node-agent reconciliation failed (check node-agent logs)",
+                    ))
+                except Exception:
+                    logger.exception("failed to report reconciliation failure for %s", lease.deployment_id)
 
         # Terminate orphaned runtimes (no longer in active leases)
         for deployment_id, runtime in list(self.repository.runtimes.items()):
@@ -161,9 +175,15 @@ class NodeAgentService:
 
     def _reconcile_workload(self, lease: LeaseAssignment) -> None:
         """Dispatch a new lease to the appropriate runtime handler based on workload kind."""
+        logger.info("reconciling lease %s (workload=%s)", lease.deployment_id, lease.workload_id)
         workload = self.control_plane.get_workload(lease.workload_id)
         if workload is None:
-            logger.warning("workload %s not found for lease %s", lease.workload_id, lease.deployment_id)
+            logger.warning("workload %s not found for lease %s — reporting failure", lease.workload_id, lease.deployment_id)
+            self.control_plane.update_deployment_status(DeploymentStatusUpdate(
+                deployment_id=lease.deployment_id,
+                state=DeploymentState.FAILED,
+                error=f"workload {lease.workload_id} not found on control plane",
+            ))
             return
 
         runtime = UnifiedRuntimeRecord(
