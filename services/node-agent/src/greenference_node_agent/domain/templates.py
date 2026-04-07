@@ -34,7 +34,7 @@ BUILTIN_TEMPLATES: dict[str, TemplateSpec] = {
         description="PyTorch with CUDA 12.1",
     ),
     "vllm": TemplateSpec(
-        image="vllm/vllm-openai:latest",
+        image="vllm/vllm-openai:v0.7.3",
         port=8000,
         gpu_fraction=1.0,
         description="vLLM OpenAI-compatible inference server",

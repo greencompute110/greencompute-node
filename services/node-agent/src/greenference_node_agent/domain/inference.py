@@ -469,7 +469,7 @@ class DockerInferenceBackend(InferenceBackend):
         *,
         backend_name: str = "docker-vllm-backend",
         health_timeout_seconds: float = 300.0,
-        default_image: str = "vllm/vllm-openai:latest",
+        default_image: str = "vllm/vllm-openai:v0.7.3",
         gpu_memory_utilization: float = 0.90,
     ) -> None:
         self.backend_name = backend_name
