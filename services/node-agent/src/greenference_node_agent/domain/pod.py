@@ -94,10 +94,10 @@ class ProcessPodBackend(PodBackend):
         for key, value in env_vars.items():
             cmd += ["-e", f"{key}={value}"]
 
-        # linuxserver/openssh-server config
-        cmd += ["-e", "PUID=0"]
-        cmd += ["-e", "PGID=0"]
-        cmd += ["-e", "USER_NAME=root"]
+        # linuxserver/openssh-server config — use default "linuxserver" user
+        # (USER_NAME=root crashes init since root already exists in /etc/passwd)
+        cmd += ["-e", "PUID=1000"]
+        cmd += ["-e", "PGID=1000"]
         cmd += ["-e", "SUDO_ACCESS=true"]
         cmd += ["-e", "PASSWORD_ACCESS=false"]
 

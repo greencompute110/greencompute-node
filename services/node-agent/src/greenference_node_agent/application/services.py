@@ -353,7 +353,7 @@ class NodeAgentService:
             "gpu_fraction": gpu_fraction,
             "ssh_host": s.ssh_host,
             "ssh_port": ssh_port,
-            "ssh_username": "root",
+            "ssh_username": "linuxserver",
             "ssh_fingerprint": None,
             "volume_path": volume.path,
             "volume_size_gb": volume_size_gb,
