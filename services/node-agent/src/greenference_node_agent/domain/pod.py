@@ -94,6 +94,13 @@ class ProcessPodBackend(PodBackend):
         for key, value in env_vars.items():
             cmd += ["-e", f"{key}={value}"]
 
+        # linuxserver/openssh-server config
+        cmd += ["-e", "PUID=0"]
+        cmd += ["-e", "PGID=0"]
+        cmd += ["-e", "USER_NAME=root"]
+        cmd += ["-e", "SUDO_ACCESS=true"]
+        cmd += ["-e", "PASSWORD_ACCESS=false"]
+
         # SSH authorized keys — set both common env vars for compatibility
         ssh_public_keys: list[str] = runtime.metadata.get("ssh_public_keys", [])
         if ssh_public_keys:
