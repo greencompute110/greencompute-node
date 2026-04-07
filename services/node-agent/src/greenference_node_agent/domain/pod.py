@@ -8,6 +8,7 @@ import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from math import floor
+from pathlib import Path
 from typing import Any
 
 from greenference_protocol import UnifiedRuntimeRecord, WorkloadSpec
@@ -101,12 +102,17 @@ class ProcessPodBackend(PodBackend):
         cmd += ["-e", "SUDO_ACCESS=true"]
         cmd += ["-e", "PASSWORD_ACCESS=false"]
 
-        # SSH authorized keys — set both common env vars for compatibility
+        # SSH authorized keys — write to a file and mount via PUBLIC_KEY_FILE
+        # (passing via env var can mangle whitespace depending on subprocess handling)
         ssh_public_keys: list[str] = runtime.metadata.get("ssh_public_keys", [])
         if ssh_public_keys:
-            keys_str = chr(10).join(ssh_public_keys)
-            cmd += ["-e", f"AUTHORIZED_KEYS={keys_str}"]
-            cmd += ["-e", f"PUBLIC_KEY={keys_str}"]
+            keys_str = "\n".join(ssh_public_keys) + "\n"
+            key_dir = Path(runtime.volume_path or "/tmp") / ".greenference-ssh"
+            key_dir.mkdir(parents=True, exist_ok=True)
+            key_file = key_dir / "authorized_keys"
+            key_file.write_text(keys_str, encoding="utf-8")
+            cmd += ["-v", f"{key_file}:/pubkey:ro"]
+            cmd += ["-e", "PUBLIC_KEY_FILE=/pubkey"]
 
         cmd.append(image)
 
