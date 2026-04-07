@@ -502,8 +502,12 @@ class DockerInferenceBackend(InferenceBackend):
         else:
             cmd += ["--gpus", "all"]
 
-        # Pass HuggingFace token if available
-        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN", "")
+        # Pass HuggingFace token — prefer workload metadata (user secret), fall back to env
+        hf_token = (
+            runtime.metadata.get("hf_token")
+            or os.environ.get("HF_TOKEN")
+            or os.environ.get("HUGGING_FACE_HUB_TOKEN", "")
+        )
         if hf_token:
             cmd += ["-e", f"HUGGING_FACE_HUB_TOKEN={hf_token}"]
 
