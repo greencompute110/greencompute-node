@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import os
 import socket
 import subprocess
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from math import floor
+from pathlib import Path
 from typing import Any
 
 from greenference_protocol import UnifiedRuntimeRecord, WorkloadSpec
+
+# Path to the SSH bootstrap entrypoint script (mounted into every pod container)
+_ENTRYPOINT_PATH = Path(__file__).resolve().parents[4] / "infra" / "docker" / "entrypoint.sh"
 
 
 def _utcnow() -> datetime:
@@ -71,9 +76,8 @@ class ProcessPodBackend(PodBackend):
             "--restart", "unless-stopped",
         ]
 
-        # SSH port forwarding — let Docker pick a free host port to avoid races
-        # Use 2222 as container port (linuxserver/openssh-server default), fallback to 22
-        container_ssh_port = runtime.metadata.get("container_ssh_port", 2222)
+        # SSH port forwarding — container always uses port 22 (injected sshd)
+        container_ssh_port = 22
         if runtime.ssh_port:
             cmd += ["-p", f"0.0.0.0::{container_ssh_port}"]
 
@@ -94,19 +98,27 @@ class ProcessPodBackend(PodBackend):
         for key, value in env_vars.items():
             cmd += ["-e", f"{key}={value}"]
 
-        # linuxserver/openssh-server config
-        # USER_NAME=root crashes (already in /etc/passwd), use "ubuntu" with uid 0 (root)
-        cmd += ["-e", "PUID=0"]
-        cmd += ["-e", "PGID=0"]
-        cmd += ["-e", "USER_NAME=ubuntu"]
-        cmd += ["-e", "SUDO_ACCESS=true"]
-        cmd += ["-e", "PASSWORD_ACCESS=false"]
-
-        # SSH authorized keys — includes ephemeral + user-provided keys
+        # SSH authorized keys — passed via AUTHORIZED_KEYS env var, read by entrypoint.sh
         ssh_public_keys: list[str] = runtime.metadata.get("ssh_public_keys", [])
         if ssh_public_keys:
             keys_str = "\n".join(ssh_public_keys)
-            cmd += ["-e", f"PUBLIC_KEY={keys_str}"]
+            cmd += ["-e", f"AUTHORIZED_KEYS={keys_str}"]
+
+        # Mount the SSH bootstrap entrypoint and override the container entrypoint.
+        # This injects sshd into any image (Vast.ai / RunPod style).
+        # The entrypoint installs openssh-server, writes keys as root, starts
+        # sshd on port 22, then execs the original CMD or `sleep infinity`.
+        #
+        # When we run inside Docker (docker-compose), the path we pass to
+        # `docker run -v` is resolved by the host daemon, not our container.
+        # GREENFERENCE_HOST_REPO_DIR tells us where the repo lives on the host.
+        host_repo = os.environ.get("GREENFERENCE_HOST_REPO_DIR", "")
+        if host_repo:
+            entrypoint = f"{host_repo}/infra/docker/entrypoint.sh"
+        else:
+            entrypoint = str(_ENTRYPOINT_PATH)
+        cmd += ["-v", f"{entrypoint}:/greenference-entrypoint.sh:ro"]
+        cmd += ["--entrypoint", "/greenference-entrypoint.sh"]
 
         cmd.append(image)
 

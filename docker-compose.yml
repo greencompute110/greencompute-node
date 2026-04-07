@@ -50,6 +50,7 @@ services:
       GREENFERENCE_SSH_PORT_RANGE_START: "${GREENFERENCE_SSH_PORT_RANGE_START:-30000}"
       GREENFERENCE_SSH_PORT_RANGE_END: "${GREENFERENCE_SSH_PORT_RANGE_END:-31000}"
       # Persistence
+      GREENFERENCE_HOST_REPO_DIR: ${GREENFERENCE_HOST_REPO_DIR:-.}
       GREENFERENCE_RUNTIME_STATE_PATH: /tmp/greenference-node-runtime-state.json
       GREENFERENCE_VOLUME_BASE_DIR: /tmp/greenference-node-volumes
       GREENFERENCE_ARTIFACT_CACHE_DIR: /tmp/greenference-node-artifacts
