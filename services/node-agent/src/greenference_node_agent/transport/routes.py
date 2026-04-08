@@ -175,10 +175,10 @@ async def inference_proxy(deployment_id: str, req: Request) -> StreamingResponse
     def _stream():
         try:
             while True:
-                chunk = resp.read(4096)
-                if not chunk:
+                line = resp.readline()
+                if not line:
                     break
-                yield chunk
+                yield line
         finally:
             resp.close()
 
