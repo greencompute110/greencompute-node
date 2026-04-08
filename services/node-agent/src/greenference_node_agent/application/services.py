@@ -167,11 +167,13 @@ class NodeAgentService:
 
         # Terminate orphaned runtimes (no longer in active leases)
         for deployment_id, runtime in list(self.repository.runtimes.items()):
-            if runtime.status in ("terminated", "failed"):
+            if deployment_id in active_deployment_ids:
                 continue
-            if deployment_id not in active_deployment_ids:
-                logger.info("terminating orphaned runtime %s", deployment_id)
-                self._terminate_runtime(runtime, reason="lease_expired")
+            if runtime.status == "terminated":
+                continue
+            # Also clean up containers for failed runtimes whose lease is gone
+            logger.info("terminating orphaned runtime %s (status=%s)", deployment_id, runtime.status)
+            self._terminate_runtime(runtime, reason="lease_expired")
 
     def _reconcile_workload(self, lease: LeaseAssignment) -> None:
         """Dispatch a new lease to the appropriate runtime handler based on workload kind."""
