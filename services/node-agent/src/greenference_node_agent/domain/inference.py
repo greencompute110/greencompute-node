@@ -887,9 +887,9 @@ def _docker_host() -> str:
             for line in f:
                 fields = line.strip().split()
                 if fields[1] == "00000000":  # default route
-                    # Gateway is in hex, little-endian
+                    # Gateway is a hex 32-bit int in host (little-endian) byte order
                     gw_hex = fields[2]
-                    gw_ip = ".".join(str(int(gw_hex[i : i + 2], 16)) for i in range(0, 8, 2))
+                    gw_ip = ".".join(str(int(gw_hex[i : i + 2], 16)) for i in range(6, -1, -2))
                     return gw_ip
     except (OSError, IndexError, ValueError):
         pass
