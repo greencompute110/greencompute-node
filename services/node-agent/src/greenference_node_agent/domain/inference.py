@@ -462,7 +462,9 @@ class ProcessInferenceBackend(InferenceBackend):
 
 
 class DockerInferenceBackend(InferenceBackend):
-    """Launches inference as a Docker container running vLLM (or compatible OpenAI server)."""
+    """Launches inference as a Docker container running vLLM or diffusion server."""
+
+    DIFFUSION_DEFAULT_IMAGE = "ghcr.io/greenference/diffusion:latest"
 
     def __init__(
         self,
@@ -477,6 +479,10 @@ class DockerInferenceBackend(InferenceBackend):
         self.default_image = default_image
         self.gpu_memory_utilization = gpu_memory_utilization
 
+    def _is_diffusion(self, artifact: ArtifactBundle) -> bool:
+        runtime_manifest = artifact.payload.get("runtime_manifest", {})
+        return str(runtime_manifest.get("runtime_kind", "")).lower() == "diffusion"
+
     def start_runtime(
         self,
         runtime: UnifiedRuntimeRecord,
@@ -485,7 +491,8 @@ class DockerInferenceBackend(InferenceBackend):
         model_id = runtime.model_identifier or artifact.image
         port = _choose_free_port()
         container_name = f"greenference-inf-{runtime.deployment_id[:12]}"
-        image = artifact.payload.get("docker_image") or self.default_image
+        is_diffusion = self._is_diffusion(artifact)
+        image = artifact.payload.get("docker_image") or (self.DIFFUSION_DEFAULT_IMAGE if is_diffusion else self.default_image)
 
         cmd: list[str] = [
             "docker", "run", "-d",
@@ -506,6 +513,7 @@ class DockerInferenceBackend(InferenceBackend):
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN", "")
         if hf_token:
             cmd += ["-e", f"HUGGING_FACE_HUB_TOKEN={hf_token}"]
+            cmd += ["-e", f"HF_TOKEN={hf_token}"]
 
         # Mount HuggingFace cache for faster repeated loads
         hf_cache = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
@@ -514,25 +522,34 @@ class DockerInferenceBackend(InferenceBackend):
 
         cmd.append(image)
 
-        # vLLM serve arguments
-        cmd += [
-            "--model", model_id,
-            "--host", "0.0.0.0",
-            "--port", "8000",
-            "--gpu-memory-utilization", str(self.gpu_memory_utilization),
-        ]
+        if is_diffusion:
+            # Diffusion server arguments
+            cmd += [
+                "--model", model_id,
+                "--host", "0.0.0.0",
+                "--port", "8000",
+            ]
+            logger.info("starting diffusion container for %s: model=%s image=%s port=%d", runtime.deployment_id, model_id, image, port)
+        else:
+            # vLLM serve arguments
+            cmd += [
+                "--model", model_id,
+                "--host", "0.0.0.0",
+                "--port", "8000",
+                "--gpu-memory-utilization", str(self.gpu_memory_utilization),
+            ]
 
-        # Optional: tensor parallel for multi-GPU
-        tp_size = artifact.payload.get("tensor_parallel_size")
-        if tp_size and int(tp_size) > 1:
-            cmd += ["--tensor-parallel-size", str(tp_size)]
+            # Optional: tensor parallel for multi-GPU
+            tp_size = artifact.payload.get("tensor_parallel_size")
+            if tp_size and int(tp_size) > 1:
+                cmd += ["--tensor-parallel-size", str(tp_size)]
 
-        # Optional: max model length
-        max_model_len = artifact.payload.get("max_model_len")
-        if max_model_len:
-            cmd += ["--max-model-len", str(max_model_len)]
+            # Optional: max model length
+            max_model_len = artifact.payload.get("max_model_len")
+            if max_model_len:
+                cmd += ["--max-model-len", str(max_model_len)]
 
-        logger.info("starting vLLM container for %s: model=%s image=%s port=%d", runtime.deployment_id, model_id, image, port)
+            logger.info("starting vLLM container for %s: model=%s image=%s port=%d", runtime.deployment_id, model_id, image, port)
 
         try:
             result = subprocess.run(  # noqa: S603
