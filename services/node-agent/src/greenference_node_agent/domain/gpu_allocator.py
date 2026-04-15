@@ -91,13 +91,13 @@ class GpuAllocator:
         }
 
     def docker_gpu_flag(self, deployment_id: str) -> list[str]:
-        """Return Docker flags for GPU allocation using --runtime=nvidia.
+        """Return the Docker --gpus flag for this deployment's allocation.
 
-        Example: ["--runtime=nvidia", "-e", "NVIDIA_VISIBLE_DEVICES=0,2,3"].
-        Returns ["--runtime=nvidia", "-e", "NVIDIA_VISIBLE_DEVICES=all"] if no allocation tracked.
+        Example: ["--gpus", "device=0,2,3"] for GPUs 0, 2, 3.
+        Returns ["--gpus", "all"] if no allocation tracked (fallback).
         """
         devices = self.get_allocation(deployment_id)
         if not devices:
-            return ["--runtime=nvidia", "-e", "NVIDIA_VISIBLE_DEVICES=all"]
+            return ["--gpus", "all"]
         device_str = ",".join(str(d) for d in devices)
-        return ["--runtime=nvidia", "-e", f"NVIDIA_VISIBLE_DEVICES={device_str}"]
+        return ["--gpus", f"device={device_str}"]

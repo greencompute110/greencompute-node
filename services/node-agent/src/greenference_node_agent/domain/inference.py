@@ -501,15 +501,14 @@ class DockerInferenceBackend(InferenceBackend):
             "-p", f"{port}:8000",
         ]
 
-        # GPU allocation — use --runtime=nvidia + NVIDIA_VISIBLE_DEVICES for
-        # broadest compatibility (works with both legacy nvidia-docker2 and
-        # newer CDI-based setups).
+        # GPU allocation — use --gpus with device= (no extra shell quotes since
+        # subprocess.run passes args directly, not through a shell).
         gpu_devices: list[int] | None = runtime.metadata.get("gpu_devices")
         if gpu_devices:
             device_str = ",".join(str(d) for d in gpu_devices)
-            cmd += ["--runtime=nvidia", "-e", f"NVIDIA_VISIBLE_DEVICES={device_str}"]
+            cmd += ["--gpus", f"device={device_str}"]
         else:
-            cmd += ["--runtime=nvidia", "-e", "NVIDIA_VISIBLE_DEVICES=all"]
+            cmd += ["--gpus", "all"]
 
         # Pass HuggingFace token from miner env (miner operator provides their own credentials)
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN", "")
