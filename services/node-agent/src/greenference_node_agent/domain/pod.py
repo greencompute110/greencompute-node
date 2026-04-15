@@ -85,13 +85,15 @@ class ProcessPodBackend(PodBackend):
         if runtime.volume_path:
             cmd += ["-v", f"{runtime.volume_path}:/workspace"]
 
-        # GPU allocation — use specific devices if assigned, otherwise all
+        # GPU allocation — use --runtime=nvidia + NVIDIA_VISIBLE_DEVICES for
+        # broadest compatibility (works with both legacy nvidia-docker2 and
+        # newer CDI-based setups).
         gpu_devices: list[int] | None = runtime.metadata.get("gpu_devices")
         if gpu_devices:
             device_str = ",".join(str(d) for d in gpu_devices)
-            cmd += ["--gpus", f'"device={device_str}"']
+            cmd += ["--runtime=nvidia", "-e", f"NVIDIA_VISIBLE_DEVICES={device_str}"]
         elif runtime.gpu_fraction > 0:
-            cmd += ["--gpus", "all"]
+            cmd += ["--runtime=nvidia", "-e", "NVIDIA_VISIBLE_DEVICES=all"]
 
         # Environment variables
         env_vars: dict[str, str] = runtime.metadata.get("env_vars", {})
