@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from greenference_protocol import ChatCompletionRequest, ChatCompletionResponse, UnifiedRuntimeRecord
 from greenference_node_agent.domain.model_backend import ModelBackendError, create_text_generation_backend
+from greenference_node_agent.domain.gpu_docker import gpu_docker_flags
 
 logger = logging.getLogger(__name__)
 
@@ -501,14 +502,9 @@ class DockerInferenceBackend(InferenceBackend):
             "-p", f"{port}:8000",
         ]
 
-        # GPU allocation — use --gpus with device= (no extra shell quotes since
-        # subprocess.run passes args directly, not through a shell).
+        # GPU passthrough — method auto-detected at startup (see gpu_docker.py)
         gpu_devices: list[int] | None = runtime.metadata.get("gpu_devices")
-        if gpu_devices:
-            device_str = ",".join(str(d) for d in gpu_devices)
-            cmd += ["--gpus", f"device={device_str}"]
-        else:
-            cmd += ["--gpus", "all"]
+        cmd += gpu_docker_flags(gpu_devices)
 
         # Pass HuggingFace token from miner env (miner operator provides their own credentials)
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN", "")

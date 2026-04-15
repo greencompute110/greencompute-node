@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from greenference_node_agent.domain.gpu_docker import gpu_docker_flags
+
 logger = logging.getLogger(__name__)
 
 
@@ -91,13 +93,6 @@ class GpuAllocator:
         }
 
     def docker_gpu_flag(self, deployment_id: str) -> list[str]:
-        """Return the Docker --gpus flag for this deployment's allocation.
-
-        Example: ["--gpus", "device=0,2,3"] for GPUs 0, 2, 3.
-        Returns ["--gpus", "all"] if no allocation tracked (fallback).
-        """
+        """Return Docker flags for GPU passthrough (auto-detected method)."""
         devices = self.get_allocation(deployment_id)
-        if not devices:
-            return ["--gpus", "all"]
-        device_str = ",".join(str(d) for d in devices)
-        return ["--gpus", f"device={device_str}"]
+        return gpu_docker_flags(devices if devices else None)

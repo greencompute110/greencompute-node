@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from greenference_protocol import UnifiedRuntimeRecord, WorkloadSpec
+from greenference_node_agent.domain.gpu_docker import gpu_docker_flags
 
 # Path to the SSH bootstrap entrypoint script (mounted into every pod container)
 _ENTRYPOINT_PATH = Path(__file__).resolve().parents[4] / "infra" / "docker" / "entrypoint.sh"
@@ -85,14 +86,10 @@ class ProcessPodBackend(PodBackend):
         if runtime.volume_path:
             cmd += ["-v", f"{runtime.volume_path}:/workspace"]
 
-        # GPU allocation — use --gpus with device= (no extra shell quotes since
-        # subprocess.run passes args directly, not through a shell).
+        # GPU passthrough — method auto-detected at startup (see gpu_docker.py)
         gpu_devices: list[int] | None = runtime.metadata.get("gpu_devices")
-        if gpu_devices:
-            device_str = ",".join(str(d) for d in gpu_devices)
-            cmd += ["--gpus", f"device={device_str}"]
-        elif runtime.gpu_fraction > 0:
-            cmd += ["--gpus", "all"]
+        if gpu_devices or runtime.gpu_fraction > 0:
+            cmd += gpu_docker_flags(gpu_devices if gpu_devices else None)
 
         # Environment variables
         env_vars: dict[str, str] = runtime.metadata.get("env_vars", {})
