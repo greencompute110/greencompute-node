@@ -157,6 +157,33 @@ def inference_healthz(deployment_id: str) -> dict:
     return {"status": "ok", "deployment_id": deployment_id}
 
 
+@router.get("/pods/{deployment_id}/stats")
+def pod_stats(deployment_id: str) -> dict:
+    """Live resource stats for a running pod/inference runtime.
+
+    Best-effort — any probe that fails is omitted from the response so the UI
+    can show partial data. Returns at most a few dozen bytes of JSON.
+    """
+    runtime = _svc().repository.get_runtime(deployment_id)
+    if runtime is None or not runtime.container_id:
+        raise HTTPException(status_code=404, detail="runtime not found")
+    if runtime.status != "ready":
+        # Runtime exists but not running — return empty stats rather than 404
+        # so the UI can keep polling without flipping into an error state.
+        return {}
+    from greenference_node_agent.domain.pod_stats import collect_pod_stats
+    gpu_devices = runtime.metadata.get("gpu_devices") or []
+    try:
+        gpu_device_ids = [int(d) for d in gpu_devices]
+    except (TypeError, ValueError):
+        gpu_device_ids = []
+    return collect_pod_stats(
+        container_id=runtime.container_id,
+        gpu_device_ids=gpu_device_ids,
+        workspace_path="/workspace",
+    )
+
+
 @router.post("/inference/{deployment_id}/v1/chat/completions")
 async def inference_proxy(deployment_id: str, req: Request) -> StreamingResponse:
     """Proxy /v1/chat/completions to the runtime's vLLM container."""
