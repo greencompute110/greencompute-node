@@ -77,10 +77,11 @@ class ProcessPodBackend(PodBackend):
             "--restart", "unless-stopped",
         ]
 
-        # SSH port forwarding — container always uses port 22 (injected sshd)
+        # SSH port forwarding — container always uses port 22 (injected sshd),
+        # host port comes from the allocator (GREENFERENCE_SSH_PORT_RANGE_*).
         container_ssh_port = 22
         if runtime.ssh_port:
-            cmd += ["-p", f"0.0.0.0::{container_ssh_port}"]
+            cmd += ["-p", f"0.0.0.0:{runtime.ssh_port}:{container_ssh_port}"]
 
         # Volume mount
         if runtime.volume_path:
