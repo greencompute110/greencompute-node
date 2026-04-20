@@ -60,9 +60,14 @@ services:
       sh -lc "apt-get update -qq && apt-get install -y -qq docker.io openssh-client >/dev/null 2>&1;
       pip install -q fastapi uvicorn pydantic substrate-interface &&
       uvicorn greenference_node_agent.main:app --host 0.0.0.0 --port 8007"
+    # User-pod SSH (30000-31000) and custom-port (31001-32000) ranges are NOT
+    # published here — user pods are sibling containers created via the host's
+    # Docker socket (see `/var/run/docker.sock` mount above), so their port
+    # bindings live directly on the host network stack. Publishing the ranges
+    # here would make docker-proxy claim every port in the range and break
+    # `docker run -p` for every subsequent rental.
     ports:
       - "8007:8007"
-      - "30000-31000:30000-31000"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"from urllib.request import urlopen; urlopen('http://127.0.0.1:8007/readyz')\""]
       interval: 5s
