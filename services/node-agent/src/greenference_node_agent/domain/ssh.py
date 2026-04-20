@@ -73,6 +73,16 @@ def choose_free_port(start: int = 30000, end: int = 31000) -> int:
     raise SSHError("no free SSH port found in range")
 
 
+def is_port_free(port: int) -> bool:
+    """Check if a specific host port can be bound on 0.0.0.0."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("0.0.0.0", port))
+            return True
+        except OSError:
+            return False
+
+
 def build_ssh_access(
     runtime: UnifiedRuntimeRecord,
     *,

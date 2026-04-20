@@ -34,7 +34,7 @@ from greenference_node_agent.domain.inference import (
 )
 from greenference_node_agent.domain.gpu_allocator import GpuAllocationError, GpuAllocator
 from greenference_node_agent.domain.pod import PodError, ProcessPodBackend, StubPodBackend
-from greenference_node_agent.domain.ssh import SSHError, build_ssh_access, choose_free_port, generate_ssh_keypair
+from greenference_node_agent.domain.ssh import SSHError, build_ssh_access, choose_free_port, generate_ssh_keypair, is_port_free
 from greenference_node_agent.domain.vm import FirecrackerVMBackend, StubVMBackend, VMError
 from greenference_node_agent.domain.volume import LocalVolumeManager, VolumeError
 from greenference_node_agent.infrastructure.repository import NodeAgentRepository
@@ -332,17 +332,28 @@ class NodeAgentService:
                 requested_ports.append(pi)
             if len(requested_ports) >= 10:
                 break
+        # Vast-style: prefer same-number mapping when the container port falls
+        # inside our host-port range and the host port is actually free. Fall
+        # back to random allocation otherwise.
         port_allocations: dict[int, int] = {}
+        used_host_ports: set[int] = set()
         for container_port in requested_ports:
-            try:
-                host_port = choose_free_port(s.user_port_range_start, s.user_port_range_end)
-                port_allocations[container_port] = host_port
-            except SSHError:
-                logger.warning(
-                    "exhausted user port range for %s — allocated %d/%d requested",
-                    runtime.deployment_id, len(port_allocations), len(requested_ports),
-                )
-                break
+            in_range = s.user_port_range_start <= container_port <= s.user_port_range_end
+            if in_range and container_port not in used_host_ports and is_port_free(container_port):
+                host_port = container_port
+            else:
+                try:
+                    host_port = choose_free_port(s.user_port_range_start, s.user_port_range_end)
+                    while host_port in used_host_ports:
+                        host_port = choose_free_port(s.user_port_range_start, s.user_port_range_end)
+                except SSHError:
+                    logger.warning(
+                        "exhausted user port range for %s — allocated %d/%d requested",
+                        runtime.deployment_id, len(port_allocations), len(requested_ports),
+                    )
+                    break
+            port_allocations[container_port] = host_port
+            used_host_ports.add(host_port)
 
         # Allocate specific GPU devices
         gpu_count = workload.requirements.gpu_count if workload.requirements else 1
