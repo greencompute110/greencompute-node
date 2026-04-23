@@ -1,6 +1,6 @@
 # greenference-node
 
-Unified miner daemon for the Green Compute Bittensor subnet (netuid 16). One process handles inference (vLLM + diffusion), GPU rental pods, and private VMs. No separate miner repos to run.
+Unified miner daemon for the Green Compute Bittensor subnet — **netuid 110 on mainnet**, **netuid 16 on testnet**. One process handles inference (vLLM + diffusion), GPU rental pods, and private VMs. No separate miner repos to run.
 
 ## what you earn for
 
