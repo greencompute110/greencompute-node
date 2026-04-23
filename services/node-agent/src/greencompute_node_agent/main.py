@@ -1,4 +1,4 @@
-"""FastAPI application entry point for the unified greenference node agent."""
+"""FastAPI application entry point for the unified greencompute node agent."""
 
 from __future__ import annotations
 
@@ -105,7 +105,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="Greenference Node Agent",
+    title="GreenCompute Node Agent",
     version="0.1.0",
     description="Unified GPU node agent — inference, pod, and VM workloads.",
     lifespan=lifespan,

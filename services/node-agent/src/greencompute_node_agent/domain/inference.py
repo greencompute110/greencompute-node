@@ -466,7 +466,7 @@ class DockerInferenceBackend(InferenceBackend):
     """Launches inference as a Docker container running vLLM or diffusion server."""
 
     DIFFUSION_DEFAULT_IMAGE = os.environ.get(
-        "GREENFERENCE_DIFFUSION_IMAGE",
+        "GREENCOMPUTE_DIFFUSION_IMAGE",
         "ghcr.io/greenference/diffusion:latest",
     )
 
@@ -481,7 +481,7 @@ class DockerInferenceBackend(InferenceBackend):
         self.backend_name = backend_name
         self.health_timeout_seconds = health_timeout_seconds
         self.default_image = default_image or os.environ.get(
-            "GREENFERENCE_VLLM_IMAGE",
+            "GREENCOMPUTE_VLLM_IMAGE",
             # v0.19.1 with CUDA 13.0 — Blackwell/sm_120 (RTX 5090) support
             # + handles recent model archs that 0.7.3 lacks.
             "vllm/vllm-openai:v0.19.1-cu130-ubuntu2404",

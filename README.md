@@ -115,15 +115,15 @@ See `.env.example` for the full list. Key ones:
 
 | Variable | What to set |
 |---|---|
-| `GREENFERENCE_CONTROL_PLANE_URL` | Validator IP + port 28001 |
-| `GREENFERENCE_MINER_VALIDATOR_URL` | Validator IP + port 28002 |
-| `GREENFERENCE_MINER_HOTKEY` | Your Bittensor hotkey (SS58) |
-| `GREENFERENCE_COLDKEY_NAME` + `_HOTKEY_NAME` | Names in `~/.bittensor/wallets/` for ed25519 signing |
-| `GREENFERENCE_GPU_MODEL` / `GPU_COUNT` / `VRAM_GB_PER_GPU` | Your actual hardware |
-| `GREENFERENCE_INFERENCE_BACKEND` | `docker` (production) |
+| `GREENCOMPUTE_CONTROL_PLANE_URL` | Validator IP + port 28001 |
+| `GREENCOMPUTE_MINER_VALIDATOR_URL` | Validator IP + port 28002 |
+| `GREENCOMPUTE_MINER_HOTKEY` | Your Bittensor hotkey (SS58) |
+| `GREENCOMPUTE_COLDKEY_NAME` + `_HOTKEY_NAME` | Names in `~/.bittensor/wallets/` for ed25519 signing |
+| `GREENCOMPUTE_GPU_MODEL` / `GPU_COUNT` / `VRAM_GB_PER_GPU` | Your actual hardware |
+| `GREENCOMPUTE_INFERENCE_BACKEND` | `docker` (production) |
 | `HF_TOKEN` | HuggingFace token for gated models (Llama, etc.) |
-| `GREENFERENCE_SSH_HOST` | Your public IP (for pod SSH) |
-| `GREENFERENCE_VLLM_IMAGE` | Override the default vLLM image tag if needed |
+| `GREENCOMPUTE_SSH_HOST` | Your public IP (for pod SSH) |
+| `GREENCOMPUTE_VLLM_IMAGE` | Override the default vLLM image tag if needed |
 
 ## HuggingFace token
 
@@ -152,7 +152,7 @@ greencompute-node/
 |---|---|---|
 | vLLM exits with `Error 804: forward compatibility was attempted on non supported HW` | Your NVIDIA driver is too old for CUDA 13 | `apt install nvidia-driver-550 && reboot` |
 | `limit-mm-per-prompt: Value image=4 cannot be converted to loads` | Old vLLM arg syntax | Update node-agent code (`git pull` this repo) — new code passes `'{"image": 4}'` JSON |
-| Deployment stuck `scheduled` forever | Node-agent can't reach control-plane | Check `GREENFERENCE_CONTROL_PLANE_URL` + firewall |
+| Deployment stuck `scheduled` forever | Node-agent can't reach control-plane | Check `GREENCOMPUTE_CONTROL_PLANE_URL` + firewall |
 | Miner keeps respawning same failed catalog model | Validator applied a 15-min cooldown | Wait; if permanent, fix host (driver/VRAM/etc) then validator auto-retries |
 | Probe fraud penalty keeps triggering | Your miner returned a cached/proxied response missing the validator's random nonce | Ensure your vLLM container is actually running the declared model + isn't being proxied |
 

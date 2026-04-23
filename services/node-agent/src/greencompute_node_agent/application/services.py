@@ -63,7 +63,7 @@ class NodeAgentService:
         )
 
         # Disk enforcement — auto-detect the strongest mode this host supports.
-        # Operator can override via GREENFERENCE_DISK_ENFORCEMENT_MODE env var.
+        # Operator can override via GREENCOMPUTE_DISK_ENFORCEMENT_MODE env var.
         self.disk_mode = detect_disk_mode(settings.disk_enforcement_mode)
         if self.disk_mode.value == "none":
             logger.warning(
@@ -307,7 +307,7 @@ class NodeAgentService:
             "model_revision": workload.metadata.get("model_revision"),
             "tokenizer_identifier": workload.metadata.get("tokenizer_identifier"),
             "seed_corpus": workload.metadata.get("seed_corpus", [
-                f"{image} serves greenference inference requests",
+                f"{image} serves greencompute inference requests",
                 "miners keep deployments healthy with recovery failover and streaming completions",
             ]),
         }

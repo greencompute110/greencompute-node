@@ -52,13 +52,13 @@ BUILTIN_TEMPLATES: dict[str, TemplateSpec] = {
         description="ComfyUI diffusion UI",
     ),
     "ubuntu-ssh": TemplateSpec(
-        image="greenference/gpu-pod:latest",
+        image="greencompute/gpu-pod:latest",
         port=22,
         gpu_fraction=0.0,
         description="Ubuntu 22.04 with SSH access (no GPU)",
     ),
     "gpu-pod": TemplateSpec(
-        image="greenference/gpu-pod:latest",
+        image="greencompute/gpu-pod:latest",
         port=22,
         gpu_fraction=1.0,
         description="GPU pod with SSH access",

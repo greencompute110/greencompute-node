@@ -93,13 +93,13 @@ class ProcessPodBackend(PodBackend):
             cmd += ["--storage-opt", f"size={runtime.volume_size_gb}G"]
 
         # SSH port forwarding — container always uses port 22 (injected sshd),
-        # host port comes from the allocator (GREENFERENCE_SSH_PORT_RANGE_*).
+        # host port comes from the allocator (GREENCOMPUTE_SSH_PORT_RANGE_*).
         container_ssh_port = 22
         if runtime.ssh_port:
             cmd += ["-p", f"0.0.0.0:{runtime.ssh_port}:{container_ssh_port}"]
 
         # Extra user-exposed ports: {container_port: host_port} pre-allocated
-        # by services.py from GREENFERENCE_USER_PORT_RANGE_* (max 10).
+        # by services.py from GREENCOMPUTE_USER_PORT_RANGE_* (max 10).
         port_allocations: dict[int, int] = runtime.metadata.get("port_allocations") or {}
         for container_port_str, host_port in port_allocations.items():
             try:
@@ -136,8 +136,8 @@ class ProcessPodBackend(PodBackend):
         #
         # When we run inside Docker (docker-compose), the path we pass to
         # `docker run -v` is resolved by the host daemon, not our container.
-        # GREENFERENCE_HOST_REPO_DIR tells us where the repo lives on the host.
-        host_repo = os.environ.get("GREENFERENCE_HOST_REPO_DIR", "")
+        # GREENCOMPUTE_HOST_REPO_DIR tells us where the repo lives on the host.
+        host_repo = os.environ.get("GREENCOMPUTE_HOST_REPO_DIR", "")
         if host_repo:
             entrypoint = f"{host_repo}/infra/docker/entrypoint.sh"
         else:

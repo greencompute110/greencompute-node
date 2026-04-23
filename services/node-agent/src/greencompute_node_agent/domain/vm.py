@@ -91,8 +91,8 @@ class FirecrackerVMBackend(VMBackend):
         self,
         *,
         backend_name: str = "firecracker-vm-backend",
-        kernel_path: str = "/opt/greenference/vmlinux",
-        rootfs_path: str = "/opt/greenference/rootfs.ext4",
+        kernel_path: str = "/opt/greencompute/vmlinux",
+        rootfs_path: str = "/opt/greencompute/rootfs.ext4",
     ) -> None:
         self.backend_name = backend_name
         self.kernel_path = kernel_path

@@ -1,11 +1,11 @@
-"""Greenference Diffusion Inference Server.
+"""GreenCompute Diffusion Inference Server.
 
 A lightweight FastAPI server that wraps HuggingFace diffusers to expose
 an OpenAI-compatible /v1/chat/completions endpoint for image generation.
 
 The server extracts the text prompt from chat messages, runs the diffusion
 pipeline, and returns the generated image as a base64 data URI embedded
-in markdown so it renders in the Greenference playground.
+in markdown so it renders in the GreenCompute playground.
 
 Usage:
     python server.py --model stabilityai/stable-diffusion-xl-base-1.0 --port 8000
@@ -221,7 +221,7 @@ def load_pipeline(model: str, dtype: str = "float16") -> DiffusionPipeline:
 def main():
     global pipeline, model_id, device
 
-    parser = argparse.ArgumentParser(description="Greenference Diffusion Server")
+    parser = argparse.ArgumentParser(description="GreenCompute Diffusion Server")
     parser.add_argument("--model", required=True, help="HuggingFace model ID")
     parser.add_argument("--host", default="0.0.0.0", help="Bind host")
     parser.add_argument("--port", type=int, default=8000, help="Bind port")

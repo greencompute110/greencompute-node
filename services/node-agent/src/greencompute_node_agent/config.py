@@ -2,35 +2,9 @@
 
 from __future__ import annotations
 
-import os as _os
+import os
 
 from pydantic import BaseModel, Field
-
-
-def _gc_getenv(name: str, default: str | None = None) -> str | None:
-    """Rebrand-aware env read. `GREENFERENCE_*` env vars are migrated to
-    `GREENCOMPUTE_*`; during the transition we read both (new prefix first).
-    Miners can set either and it Just Works."""
-    if name.startswith("GREENFERENCE_"):
-        new_key = "GREENCOMPUTE_" + name[len("GREENFERENCE_"):]
-        v = _os.environ.get(new_key)
-        if v is not None:
-            return v
-    v = _os.environ.get(name)
-    return v if v is not None else default
-
-
-# Lightweight shim: expose `os.getenv` that routes through _gc_getenv, so
-# every existing `os.getenv("GREENFERENCE_X", default)` call in this module
-# keeps working without hand-editing each one. This shim is module-scoped
-# only — it does not alter the global `os` module.
-class _Os:  # noqa: N801 — intentional module-local name
-    getenv = staticmethod(_gc_getenv)
-    environ = _os.environ
-    path = _os.path
-
-
-os = _Os()  # noqa: F841 — intentional shadow of `os` within this file
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -115,52 +89,52 @@ class Settings(BaseModel):
 
 
 def load_settings() -> Settings:
-    miner_hotkey = os.getenv("GREENFERENCE_MINER_HOTKEY", "node-local")
+    miner_hotkey = os.getenv("GREENCOMPUTE_MINER_HOTKEY", "node-local")
     # node_id is the PRIMARY KEY of the control-plane's node_inventory table,
     # so two miners sharing the same `node_id` will silently overwrite each
     # other's capacity updates. If the operator hasn't set
-    # GREENFERENCE_MINER_NODE_ID, derive a unique default from the hotkey
+    # GREENCOMPUTE_MINER_NODE_ID, derive a unique default from the hotkey
     # so fresh installs can't collide out-of-the-box.
     default_node_id = f"node-{miner_hotkey[:12]}" if miner_hotkey else "node-local"
     return Settings(
-        enable_background_workers=_env_bool("GREENFERENCE_ENABLE_BACKGROUND_WORKERS", False),
-        worker_poll_interval_seconds=float(os.getenv("GREENFERENCE_WORKER_POLL_INTERVAL_SECONDS", "1.0")),
-        bootstrap_miner=_env_bool("GREENFERENCE_BOOTSTRAP_MINER", False),
-        runtime_state_path=os.getenv("GREENFERENCE_RUNTIME_STATE_PATH", "/tmp/greencompute-node-runtime-state.json"),
-        artifact_cache_dir=os.getenv("GREENFERENCE_ARTIFACT_CACHE_DIR", "/tmp/greencompute-node-artifacts"),
-        volume_base_dir=os.getenv("GREENFERENCE_VOLUME_BASE_DIR", "/tmp/greencompute-node-volumes"),
-        control_plane_url=os.getenv("GREENFERENCE_CONTROL_PLANE_URL", "http://127.0.0.1:8001"),
+        enable_background_workers=_env_bool("GREENCOMPUTE_ENABLE_BACKGROUND_WORKERS", False),
+        worker_poll_interval_seconds=float(os.getenv("GREENCOMPUTE_WORKER_POLL_INTERVAL_SECONDS", "1.0")),
+        bootstrap_miner=_env_bool("GREENCOMPUTE_BOOTSTRAP_MINER", False),
+        runtime_state_path=os.getenv("GREENCOMPUTE_RUNTIME_STATE_PATH", "/tmp/greencompute-node-runtime-state.json"),
+        artifact_cache_dir=os.getenv("GREENCOMPUTE_ARTIFACT_CACHE_DIR", "/tmp/greencompute-node-artifacts"),
+        volume_base_dir=os.getenv("GREENCOMPUTE_VOLUME_BASE_DIR", "/tmp/greencompute-node-volumes"),
+        control_plane_url=os.getenv("GREENCOMPUTE_CONTROL_PLANE_URL", "http://127.0.0.1:8001"),
         miner_hotkey=miner_hotkey,
-        miner_payout_address=os.getenv("GREENFERENCE_MINER_PAYOUT_ADDRESS", "5FnodeLocal"),
-        miner_auth_secret=os.getenv("GREENFERENCE_MINER_AUTH_SECRET", "greencompute-node-local-secret"),
-        miner_api_base_url=os.getenv("GREENFERENCE_MINER_API_BASE_URL", "http://127.0.0.1:8007"),
-        miner_validator_url=os.getenv("GREENFERENCE_MINER_VALIDATOR_URL", "http://127.0.0.1:8002"),
-        node_id=os.getenv("GREENFERENCE_MINER_NODE_ID", default_node_id),
-        gpu_model=os.getenv("GREENFERENCE_GPU_MODEL", "a100"),
-        gpu_count=int(os.getenv("GREENFERENCE_GPU_COUNT", "1")),
-        available_gpus=int(os.getenv("GREENFERENCE_GPU_COUNT", "1")),
-        vram_gb_per_gpu=int(os.getenv("GREENFERENCE_VRAM_GB_PER_GPU", "80")),
-        cpu_cores=int(os.getenv("GREENFERENCE_CPU_CORES", "32")),
-        memory_gb=int(os.getenv("GREENFERENCE_MEMORY_GB", "128")),
-        performance_score=float(os.getenv("GREENFERENCE_PERFORMANCE_SCORE", "1.0")),
-        gpu_split_units=int(os.getenv("GREENFERENCE_GPU_SPLIT_UNITS", "100")),
-        security_tier=os.getenv("GREENFERENCE_SECURITY_TIER", "standard"),
-        attestation_enabled=_env_bool("GREENFERENCE_ATTESTATION_ENABLED", False),
-        pod_backend=os.getenv("GREENFERENCE_POD_BACKEND", "process"),
-        vm_backend=os.getenv("GREENFERENCE_VM_BACKEND", "stub"),
-        inference_backend=os.getenv("GREENFERENCE_INFERENCE_BACKEND", "process"),
-        allow_runtime_fallback=_env_bool("GREENFERENCE_ALLOW_RUNTIME_FALLBACK", False),
-        supported_workload_kinds=os.getenv("GREENFERENCE_SUPPORTED_WORKLOAD_KINDS", "inference,pod,vm").split(","),
-        ssh_host=os.getenv("GREENFERENCE_SSH_HOST", "127.0.0.1"),
-        ssh_port_range_start=int(os.getenv("GREENFERENCE_SSH_PORT_RANGE_START", "30000")),
-        ssh_port_range_end=int(os.getenv("GREENFERENCE_SSH_PORT_RANGE_END", "31000")),
-        user_port_range_start=int(os.getenv("GREENFERENCE_USER_PORT_RANGE_START", "31001")),
-        user_port_range_end=int(os.getenv("GREENFERENCE_USER_PORT_RANGE_END", "32000")),
-        disk_enforcement_mode=os.getenv("GREENFERENCE_DISK_ENFORCEMENT_MODE") or None,
-        auth_mode=os.getenv("GREENFERENCE_AUTH_MODE", "hmac"),
-        coldkey_name=os.getenv("GREENFERENCE_COLDKEY_NAME") or None,
-        hotkey_name=os.getenv("GREENFERENCE_HOTKEY_NAME", "default"),
-        agent_auth_secret=os.getenv("GREENFERENCE_AGENT_AUTH_SECRET") or None,
-        inference_auth_secret=os.getenv("GREENFERENCE_INFERENCE_AUTH_SECRET") or None,
-        compute_auth_secret=os.getenv("GREENFERENCE_COMPUTE_AUTH_SECRET") or None,
+        miner_payout_address=os.getenv("GREENCOMPUTE_MINER_PAYOUT_ADDRESS", "5FnodeLocal"),
+        miner_auth_secret=os.getenv("GREENCOMPUTE_MINER_AUTH_SECRET", "greencompute-node-local-secret"),
+        miner_api_base_url=os.getenv("GREENCOMPUTE_MINER_API_BASE_URL", "http://127.0.0.1:8007"),
+        miner_validator_url=os.getenv("GREENCOMPUTE_MINER_VALIDATOR_URL", "http://127.0.0.1:8002"),
+        node_id=os.getenv("GREENCOMPUTE_MINER_NODE_ID", default_node_id),
+        gpu_model=os.getenv("GREENCOMPUTE_GPU_MODEL", "a100"),
+        gpu_count=int(os.getenv("GREENCOMPUTE_GPU_COUNT", "1")),
+        available_gpus=int(os.getenv("GREENCOMPUTE_GPU_COUNT", "1")),
+        vram_gb_per_gpu=int(os.getenv("GREENCOMPUTE_VRAM_GB_PER_GPU", "80")),
+        cpu_cores=int(os.getenv("GREENCOMPUTE_CPU_CORES", "32")),
+        memory_gb=int(os.getenv("GREENCOMPUTE_MEMORY_GB", "128")),
+        performance_score=float(os.getenv("GREENCOMPUTE_PERFORMANCE_SCORE", "1.0")),
+        gpu_split_units=int(os.getenv("GREENCOMPUTE_GPU_SPLIT_UNITS", "100")),
+        security_tier=os.getenv("GREENCOMPUTE_SECURITY_TIER", "standard"),
+        attestation_enabled=_env_bool("GREENCOMPUTE_ATTESTATION_ENABLED", False),
+        pod_backend=os.getenv("GREENCOMPUTE_POD_BACKEND", "process"),
+        vm_backend=os.getenv("GREENCOMPUTE_VM_BACKEND", "stub"),
+        inference_backend=os.getenv("GREENCOMPUTE_INFERENCE_BACKEND", "process"),
+        allow_runtime_fallback=_env_bool("GREENCOMPUTE_ALLOW_RUNTIME_FALLBACK", False),
+        supported_workload_kinds=os.getenv("GREENCOMPUTE_SUPPORTED_WORKLOAD_KINDS", "inference,pod,vm").split(","),
+        ssh_host=os.getenv("GREENCOMPUTE_SSH_HOST", "127.0.0.1"),
+        ssh_port_range_start=int(os.getenv("GREENCOMPUTE_SSH_PORT_RANGE_START", "30000")),
+        ssh_port_range_end=int(os.getenv("GREENCOMPUTE_SSH_PORT_RANGE_END", "31000")),
+        user_port_range_start=int(os.getenv("GREENCOMPUTE_USER_PORT_RANGE_START", "31001")),
+        user_port_range_end=int(os.getenv("GREENCOMPUTE_USER_PORT_RANGE_END", "32000")),
+        disk_enforcement_mode=os.getenv("GREENCOMPUTE_DISK_ENFORCEMENT_MODE") or None,
+        auth_mode=os.getenv("GREENCOMPUTE_AUTH_MODE", "hmac"),
+        coldkey_name=os.getenv("GREENCOMPUTE_COLDKEY_NAME") or None,
+        hotkey_name=os.getenv("GREENCOMPUTE_HOTKEY_NAME", "default"),
+        agent_auth_secret=os.getenv("GREENCOMPUTE_AGENT_AUTH_SECRET") or None,
+        inference_auth_secret=os.getenv("GREENCOMPUTE_INFERENCE_AUTH_SECRET") or None,
+        compute_auth_secret=os.getenv("GREENCOMPUTE_COMPUTE_AUTH_SECRET") or None,
     )

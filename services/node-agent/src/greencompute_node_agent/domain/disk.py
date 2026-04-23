@@ -33,7 +33,7 @@ def detect_disk_mode(override: str | None = None) -> DiskMode:
         try:
             return DiskMode(override.lower())
         except ValueError:
-            logger.warning("invalid GREENFERENCE_DISK_ENFORCEMENT_MODE=%r — falling back to auto", override)
+            logger.warning("invalid GREENCOMPUTE_DISK_ENFORCEMENT_MODE=%r — falling back to auto", override)
 
     # 1. Root — can loop-mount directly.
     if _has_mount_tools() and os.geteuid() == 0:
