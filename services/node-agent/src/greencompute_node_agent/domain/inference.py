@@ -585,7 +585,17 @@ class DockerInferenceBackend(InferenceBackend):
             # Best-effort — if docker is missing or the rm hangs, let the
             # subsequent `docker run` be the authoritative failure.
             pass
-        image = artifact.payload.get("docker_image") or (self.DIFFUSION_DEFAULT_IMAGE if is_diffusion else self.default_image)
+        # Image resolution. Diffusion sticks with the workload-supplied image
+        # (or DIFFUSION_DEFAULT_IMAGE) since that's protocol-specific.
+        # For vLLM, the MINER's locally-auto-picked image (or operator's
+        # GREENCOMPUTE_VLLM_IMAGE override) wins over the validator's hint —
+        # the miner knows its hardware (driver/compute_cap) and is the only
+        # one that can pick a compatible cu130-vs-cu12 build. Falls back to
+        # the workload's docker_image only when no local default exists.
+        if is_diffusion:
+            image = artifact.payload.get("docker_image") or self.DIFFUSION_DEFAULT_IMAGE
+        else:
+            image = self.default_image or artifact.payload.get("docker_image")
 
         cmd: list[str] = [
             "docker", "run", "-d",
