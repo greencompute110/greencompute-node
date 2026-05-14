@@ -608,8 +608,17 @@ class DockerInferenceBackend(InferenceBackend):
         gpu_devices: list[int] | None = runtime.metadata.get("gpu_devices")
         cmd += gpu_docker_flags(gpu_devices)
 
-        # Pass HuggingFace token from miner env (miner operator provides their own credentials)
-        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN", "")
+        # HuggingFace token resolution. Preference order:
+        #   1. user-supplied token on the deployment (artifact.payload.hf_token)
+        #      — lets a user deploy a gated model the miner hasn't seen.
+        #   2. miner operator's HF_TOKEN / HUGGING_FACE_HUB_TOKEN env — the
+        #      default for any model the miner already has access to.
+        user_hf_token = artifact.payload.get("hf_token")
+        hf_token = (
+            user_hf_token
+            if isinstance(user_hf_token, str) and user_hf_token.strip()
+            else os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN", "")
+        )
         if hf_token:
             cmd += ["-e", f"HUGGING_FACE_HUB_TOKEN={hf_token}"]
             cmd += ["-e", f"HF_TOKEN={hf_token}"]

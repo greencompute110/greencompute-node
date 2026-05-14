@@ -321,6 +321,13 @@ class NodeAgentService:
             "docker_image": image,
             "runtime_manifest": runtime_manifest,
         }
+        # User-supplied HuggingFace token (gated models). When present, the
+        # node-agent injects it into the container env in preference to the
+        # miner operator's own HF_TOKEN — lets a user deploy a gated model
+        # even when the miner hasn't pre-configured creds for that repo.
+        hf_token = workload.metadata.get("hf_token")
+        if isinstance(hf_token, str) and hf_token.strip():
+            payload["hf_token"] = hf_token.strip()
 
         try:
             artifact = self.artifact_store.stage_artifact(
