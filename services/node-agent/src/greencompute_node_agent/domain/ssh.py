@@ -42,6 +42,21 @@ def generate_ssh_keypair() -> tuple[str, str]:
         raise SSHError(f"ssh-keygen not available: {exc}") from exc
 
 
+def pod_ssh_keys(user_keys: list[str] | None) -> tuple[str | None, list[str]]:
+    """The public keys a pod's sshd accepts, and the private half of any key
+    the platform generated for it, as (private_key, public_keys).
+
+    A workload that brings its own keys gets exactly those: no platform key is
+    generated, so nobody but the user holds a key to the pod. Only a workload
+    with none gets a generated keypair, whose private half the owner fetches
+    from the API's /ssh endpoint."""
+    own = [k.strip() for k in (user_keys or []) if isinstance(k, str) and k.strip()]
+    if own:
+        return None, own
+    private_key, public_key = generate_ssh_keypair()
+    return private_key, [public_key]
+
+
 def _fingerprint_from_public_key(public_key_openssh: str) -> str:
     """Compute a SHA256 fingerprint from the public key bytes."""
     parts = public_key_openssh.strip().split()

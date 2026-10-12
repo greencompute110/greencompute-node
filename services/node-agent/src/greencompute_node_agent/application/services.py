@@ -38,7 +38,7 @@ from greencompute_node_agent.domain.multinode_launch import is_worker_runtime
 from greencompute_node_agent.domain.gpu_allocator import GpuAllocationError, GpuAllocator
 from greencompute_node_agent.domain.disk import detect_disk_mode
 from greencompute_node_agent.domain.pod import PodError, ProcessPodBackend, StubPodBackend
-from greencompute_node_agent.domain.ssh import SSHError, build_ssh_access, choose_free_port, generate_ssh_keypair, is_port_free
+from greencompute_node_agent.domain.ssh import SSHError, build_ssh_access, choose_free_port, is_port_free, pod_ssh_keys
 from greencompute_node_agent.domain.vm import FirecrackerVMBackend, StubVMBackend, VMError
 from greencompute_node_agent.domain.volume import LocalVolumeManager, VolumeError
 from greencompute_node_agent.infrastructure.repository import NodeAgentRepository
@@ -587,10 +587,11 @@ class NodeAgentService:
         template_name = workload.metadata.get("template")
         logger.info("starting pod runtime for %s (template: %s)", runtime.deployment_id, template_name)
 
-        # Pick SSH port and generate keypair
+        # Pick an SSH port; generate a keypair only if the workload brought no
+        # keys of its own.
         try:
             ssh_port = choose_free_port(s.ssh_port_range_start, s.ssh_port_range_end)
-            private_key, public_key = generate_ssh_keypair()
+            private_key, ssh_public_keys = pod_ssh_keys(workload.metadata.get("ssh_public_keys"))
         except SSHError:
             logger.exception("SSH setup failed for %s", runtime.deployment_id)
             self._fail_runtime(runtime, "SSH setup failed")
@@ -718,11 +719,7 @@ class NodeAgentService:
             "metadata": {
                 **runtime.metadata,
                 "image": image,
-                "ssh_public_keys": [
-                    public_key,
-                    # Include user-provided SSH keys from workload metadata
-                    *[k for k in (workload.metadata.get("ssh_public_keys") or []) if k.strip()],
-                ],
+                "ssh_public_keys": ssh_public_keys,
                 "ssh_private_key": private_key,
                 "gpu_devices": gpu_devices,
                 "gpu_count": gpu_count,
