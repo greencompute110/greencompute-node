@@ -19,6 +19,9 @@ def is_secret_key(key: str) -> bool:
     # NB: keep ssh_public_keys / ssh_fingerprint visible — only private material.
     return (
         "private_key" in k
+        # A pod's environment and start command, from the user: any of it
+        # may be a credential, whatever the variable is called.
+        or k == "env_vars"
         or "secret" in k
         or "password" in k
         or "hf_token" in k
