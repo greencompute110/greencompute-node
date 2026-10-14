@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import secrets
 import socket
@@ -55,6 +56,19 @@ def pod_ssh_keys(user_keys: list[str] | None) -> tuple[str | None, list[str]]:
         return None, own
     private_key, public_key = generate_ssh_keypair()
     return private_key, [public_key]
+
+
+def pod_start_env(workload_metadata: dict | None) -> dict[str, str]:
+    """Container environment for a pod: the workload's `env`, plus its start
+    `command` base64-encoded in GC_START_COMMAND_B64 for the entrypoint to run
+    (base64 keeps quotes and newlines intact through docker -e). The gateway
+    has already validated both."""
+    meta = workload_metadata or {}
+    env = {str(k): str(v) for k, v in (meta.get("env") or {}).items()} if isinstance(meta.get("env"), dict) else {}
+    command = meta.get("command")
+    if isinstance(command, str) and command.strip():
+        env["GC_START_COMMAND_B64"] = base64.b64encode(command.encode()).decode()
+    return env
 
 
 def _fingerprint_from_public_key(public_key_openssh: str) -> str:

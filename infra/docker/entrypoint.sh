@@ -92,7 +92,7 @@ persist_image_env() {
     local etcenv="${GC_ETC_ENV_FILE:-/etc/environment}"
     local etcnew="${etcenv}.greencompute.$$"
     local names=" "
-    local skip='^(HOSTNAME|HOME|PWD|OLDPWD|SHLVL|TERM|_|SHELL|USER|LOGNAME|MAIL|AUTHORIZED_KEYS)$'
+    local skip='^(HOSTNAME|HOME|PWD|OLDPWD|SHLVL|TERM|_|SHELL|USER|LOGNAME|MAIL|AUTHORIZED_KEYS|GC_START_COMMAND_B64)$'
     mkdir -p "$(dirname "$profile")" "$(dirname "$sshenv")"
     : > "$profile"
     : > "$sshenv"
@@ -131,6 +131,30 @@ persist_image_env() {
     chmod 600 "$sshenv"
 }
 
+# --- Start command from the workload (metadata.command) ---
+# Runs in the background once SSH is up, from /workspace, with its output
+# appended to /workspace/greencompute-command.log. The pod stays up when the
+# command finishes, so you can still SSH in and read the log; the rental
+# stops on DELETE or when max_runtime_minutes is reached. The command arrives
+# base64-encoded so quotes and newlines survive the trip through docker -e.
+# Paths are overridable (GC_COMMAND_*) for tests.
+run_start_command() {
+    local encoded="${GC_START_COMMAND_B64:-}"
+    [ -n "$encoded" ] || return 0
+    local workdir="${GC_COMMAND_WORKDIR:-/workspace}"
+    local logfile="${GC_COMMAND_LOG:-$workdir/greencompute-command.log}"
+    local script="${GC_COMMAND_FILE:-/greencompute-start-command.sh}"
+    if ! printf '%s' "$encoded" | base64 -d > "$script" 2>/dev/null; then
+        echo "[greencompute] WARN: could not decode the start command" >&2
+        return 1
+    fi
+    mkdir -p "$workdir"
+    local shell=bash
+    command -v bash >/dev/null 2>&1 || shell=sh
+    echo "[greencompute] running the workload's start command; output in $logfile"
+    ( cd "$workdir" && nohup "$shell" "$script" >>"$logfile" 2>&1 & )
+}
+
 echo "[greencompute] setting up SSH..."
 if install_ssh; then
     configure_ssh
@@ -140,6 +164,8 @@ if install_ssh; then
 else
     echo "[greencompute] SSH setup failed — container will run without SSH" >&2
 fi
+
+run_start_command || echo "[greencompute] WARN: start command not run" >&2
 
 # --- Run original command or sleep forever ---
 if [ $# -gt 0 ]; then
