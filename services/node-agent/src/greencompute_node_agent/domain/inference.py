@@ -601,6 +601,37 @@ def _vllm_image_uses_json_mm_limit(image: str) -> bool:
     return (major, minor) >= (0, 10)
 
 
+# A text model with no context limit set is served at the longest context that
+# fits next to its weights, not its native maximum, which often doesn't fit
+# (Llama 3.1 8B on a 24 GB card: 128k needs 16 GB of KV cache, ~5 GB is left,
+# and vLLM refuses to start). vLLM >= 0.19 does this itself with
+# `--max-model-len auto`; older images (the cu12 v0.8.5 one) get a fixed cap.
+_LEGACY_TEXT_MAX_MODEL_LEN = 32768
+
+
+def _vllm_image_auto_fits_context(image: str) -> bool:
+    """`--max-model-len auto` (largest context that fits): verified in vLLM
+    0.19. Unparseable tags are assumed current, like the default image."""
+    m = re.search(r"v?(\d+)\.(\d+)", image or "")
+    if not m:
+        return True
+    return (int(m.group(1)), int(m.group(2))) >= (0, 19)
+
+
+_ERROR_LINE = re.compile(r"\b([A-Za-z_.]*(?:Error|Exception)): (.+)$")
+
+
+def _startup_error_summary(logs: str) -> str | None:
+    """The line that says why a model server died, e.g. vLLM's "ValueError: To
+    serve at least one request ... KV cache ...", rather than the generic
+    "Engine core initialization failed" it ends with."""
+    for line in logs.splitlines():
+        m = _ERROR_LINE.search(line.strip())
+        if m and "Engine core initialization failed" not in m.group(2):
+            return f"{m.group(1)}: {m.group(2)}"[:500]
+    return None
+
+
 class DockerInferenceBackend(InferenceBackend):
     """Launches inference as a Docker container running vLLM or diffusion server."""
 
@@ -776,8 +807,9 @@ class DockerInferenceBackend(InferenceBackend):
             is_vision = self._looks_like_vision_model(model_id)
             if not max_model_len and is_vision:
                 max_model_len = 16384
-            if max_model_len:
-                cmd += ["--max-model-len", str(max_model_len)]
+            if not max_model_len:
+                max_model_len = "auto" if _vllm_image_auto_fits_context(image) else _LEGACY_TEXT_MAX_MODEL_LEN
+            cmd += ["--max-model-len", str(max_model_len)]
 
             # Multimodal: cap per-prompt media counts so vLLM allocates the right
             # number of image placeholders. Without this, some vLLM versions
@@ -1083,9 +1115,11 @@ class DockerInferenceBackend(InferenceBackend):
                         # Merge stderr + stdout — model wrappers vary on which
                         # stream they print the error to.
                         combined = (logs.stdout or "") + (logs.stderr or "")
-                        # Trim any leading whitespace but keep the full tail.
+                        summary = _startup_error_summary(combined)
+                        # Lead with the reason; keep the full tail below it.
                         raise InferenceRuntimeError(
-                            f"container exited prematurely:\n{combined.strip() or '<no output>'}",
+                            f"container exited prematurely{': ' + summary if summary else ''}\n"
+                            f"{combined.strip() or '<no output>'}",
                             failure_class="runtime_start_failure",
                             stage="health_check",
                         )
