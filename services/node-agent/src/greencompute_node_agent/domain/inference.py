@@ -13,6 +13,7 @@ import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 from urllib import request
 from urllib.error import HTTPError, URLError
@@ -58,6 +59,16 @@ class ArtifactBundle(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+def _notify(callback: Callable[[], None] | None) -> None:
+    """Run a progress callback; a failing one must never stop a start."""
+    if callback is None:
+        return
+    try:
+        callback()
+    except Exception:
+        logger.exception("progress callback failed")
+
+
 class InferenceBackend:
     """Abstract inference runtime backend."""
 
@@ -65,6 +76,7 @@ class InferenceBackend:
         self,
         runtime: UnifiedRuntimeRecord,
         artifact: ArtifactBundle,
+        on_started: Callable[[], None] | None = None,
     ) -> UnifiedRuntimeRecord:
         raise NotImplementedError
 
@@ -97,6 +109,7 @@ class LocalArtifactInferenceBackend(InferenceBackend):
         self,
         runtime: UnifiedRuntimeRecord,
         artifact: ArtifactBundle,
+        on_started: Callable[[], None] | None = None,
     ) -> UnifiedRuntimeRecord:
         manifest = self._runtime_manifest(artifact.payload, artifact.image)
         backend = create_text_generation_backend(manifest, image=artifact.image, allow_fallback=True)
@@ -244,9 +257,10 @@ class ProcessInferenceBackend(InferenceBackend):
         self,
         runtime: UnifiedRuntimeRecord,
         artifact: ArtifactBundle,
+        on_started: Callable[[], None] | None = None,
     ) -> UnifiedRuntimeRecord:
         try:
-            return self._start_process_runtime(runtime, artifact)
+            return self._start_process_runtime(runtime, artifact, on_started)
         except PermissionError as exc:
             return self._start_fallback_runtime(runtime, artifact, reason=str(exc))
         except InferenceRuntimeError as exc:
@@ -285,6 +299,7 @@ class ProcessInferenceBackend(InferenceBackend):
         self,
         runtime: UnifiedRuntimeRecord,
         artifact: ArtifactBundle,
+        on_started: Callable[[], None] | None = None,
     ) -> UnifiedRuntimeRecord:
         if runtime.runtime_dir is None:
             raise InferenceRuntimeError(
@@ -350,6 +365,7 @@ class ProcessInferenceBackend(InferenceBackend):
             },
             "updated_at": utcnow(),
         })
+        _notify(on_started)
         self._wait_for_health(runtime)
         return runtime
 
@@ -681,6 +697,7 @@ class DockerInferenceBackend(InferenceBackend):
         self,
         runtime: UnifiedRuntimeRecord,
         artifact: ArtifactBundle,
+        on_started: Callable[[], None] | None = None,
     ) -> UnifiedRuntimeRecord:
         model_id = runtime.model_identifier or artifact.image
         port = _choose_free_port()
@@ -916,7 +933,9 @@ class DockerInferenceBackend(InferenceBackend):
                 )
             return runtime
 
-        # vLLM takes time to load — wait for health
+        # vLLM takes time to load — wait for health. The container is up, so
+        # tell the caller: the slow part (weights download + load) starts now.
+        _notify(on_started)
         try:
             self._wait_for_health(runtime)
         except InferenceRuntimeError:

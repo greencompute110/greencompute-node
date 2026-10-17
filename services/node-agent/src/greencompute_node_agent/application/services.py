@@ -555,9 +555,15 @@ class NodeAgentService:
         })
         self.repository.upsert_runtime(runtime)
 
-        # Start inference process
+        # Start inference process: downloading the image first, then the
+        # (often long) weights download + load once the container is up.
+        self._report_progress(runtime, DeploymentState.PULLING)
+        started_runtime = runtime
         try:
-            runtime = self.inference_backend.start_runtime(runtime, artifact)
+            runtime = self.inference_backend.start_runtime(
+                runtime, artifact,
+                on_started=lambda: self._report_progress(started_runtime, DeploymentState.STARTING),
+            )
         except InferenceRuntimeError as exc:
             logger.exception("inference start failed for %s", runtime.deployment_id)
             self._fail_runtime(runtime, str(exc))
@@ -731,13 +737,15 @@ class NodeAgentService:
         })
         self.repository.upsert_runtime(runtime)
 
-        # Start container
+        # Start container (downloading the image if it isn't cached yet)
+        self._report_progress(runtime, DeploymentState.PULLING)
         try:
             runtime = self.pod_backend.start_pod(runtime, workload)
         except PodError as exc:
             logger.exception("pod start failed for %s", runtime.deployment_id)
             self._fail_runtime(runtime, str(exc))
             return
+        self._report_progress(runtime, DeploymentState.STARTING)
 
         # Confirm sshd actually came up before reporting the pod ready, so the
         # customer isn't handed a pod they can't connect to. The check is
@@ -819,6 +827,18 @@ class NodeAgentService:
         return self.inference_backend.invoke(runtime, request)
 
     # --- Runtime lifecycle helpers ---
+
+    def _report_progress(self, runtime: UnifiedRuntimeRecord, state: DeploymentState) -> None:
+        """Tell the control plane which step a start is on (PULLING: getting
+        the image; STARTING: container up, waiting for SSH or the model to
+        load), so the customer sees progress rather than one long 'scheduled'.
+        Best effort: a failed report never affects the start itself."""
+        try:
+            self.control_plane.update_deployment_status(DeploymentStatusUpdate(
+                deployment_id=runtime.deployment_id, state=state,
+            ))
+        except Exception:
+            logger.warning("could not report %s for %s", state.value, runtime.deployment_id, exc_info=True)
 
     def _report_deployment_ready(self, runtime: UnifiedRuntimeRecord) -> None:
         try:
