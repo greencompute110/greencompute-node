@@ -23,6 +23,39 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def _last_log_lines(container_id: str, count: int = 5) -> str:
+    try:
+        logs = subprocess.run(  # noqa: S603
+            ["docker", "logs", "--tail", str(count), container_id],  # noqa: S607
+            capture_output=True, text=True, timeout=5.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return "(unavailable)"
+    lines = [line.strip() for line in ((logs.stdout or "") + (logs.stderr or "")).splitlines() if line.strip()]
+    return " | ".join(lines[-count:]) or "(none)"
+
+
+def sshd_in_process_list(docker_top_output: str) -> bool:
+    """Is sshd itself among these `docker top` rows? The command is the last
+    column (named CMD or COMMAND; it may contain spaces) and its first word is
+    the executable: `/usr/sbin/sshd -D`, or `sshd: /usr/sbin/sshd [listener]`
+    once OpenSSH 9.8+ has set its process title."""
+    lines = [line for line in docker_top_output.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False
+    header = lines[0].split()
+    column = next((i for i, name in enumerate(header) if name.upper() in ("CMD", "COMMAND")), len(header) - 1)
+    for row in lines[1:]:
+        fields = row.split(None, column)
+        if len(fields) <= column:
+            continue
+        words = fields[column].split()
+        executable = words[0].rstrip(":").rsplit("/", 1)[-1] if words else ""
+        if executable == "sshd":
+            return True
+    return False
+
+
 class PodError(RuntimeError):
     def __init__(self, message: str, *, failure_class: str, stage: str) -> None:
         super().__init__(message)
@@ -257,37 +290,47 @@ class ProcessPodBackend(PodBackend):
             }
         )
 
-    def wait_for_ready(
-        self,
-        runtime: UnifiedRuntimeRecord,
-        *,
-        timeout_seconds: float = 90.0,
-    ) -> bool:
-        """Wait until the pod's sshd is actually up. Returns True once it is.
+    def ssh_status(self, runtime: UnifiedRuntimeRecord) -> tuple[str, str | None]:
+        """One non-blocking look at a started pod's SSH: ("up", None) once
+        sshd runs, ("pending", None) while it still might, or ("failed",
+        reason) once it never can, with the reason in words for the customer.
+        The node agent calls this once per reconcile tick; a blocking wait
+        here (as before) stalled every other lease on the node for as long as
+        apt-get took.
 
         Checks INSIDE the container via the docker socket, NOT by dialing the
         node's public SSH host. On our providers the node can't reach its own
         public IP (NAT hairpin), so the old `socket.create_connection(
         (ssh_host, ssh_port))` false-negatived on EVERY pod and burned the full
-        timeout without ever verifying anything. The entrypoint installs
-        openssh (apt-get — can be slow on a cold pod) then starts sshd, so we
-        poll the container's process list until the daemon appears.
+        timeout without ever verifying anything.
         """
         container = runtime.container_id
         if not container:
-            return True  # stub / no container — nothing to verify
-        deadline = time.time() + timeout_seconds
-        while time.time() < deadline:
-            if self._sshd_running(container):
-                return True
-            time.sleep(1.5)
-        return False
+            return "up", None  # stub / no container — nothing to verify
+        # A container that keeps exiting is checked first: Docker restarts it
+        # (--restart unless-stopped), so sshd may well be "up" for a moment in
+        # each cycle and would otherwise be reported ready at random.
+        dead = self._container_problem(container)
+        if dead:
+            return "failed", dead
+        if self._sshd_running(container):
+            return "up", None
+        problem = self._ssh_setup_problem(container)
+        if problem:
+            return "failed", problem
+        return "pending", None
 
     @staticmethod
     def _sshd_running(container_id: str) -> bool:
-        """True once the sshd daemon is running inside the pod. `docker top`
-        reads the container's processes host-side, so it needs no tooling in
-        the user's image and is immune to the node's own network/hairpin."""
+        """True once the sshd daemon itself is running inside the pod. `docker
+        top` reads the container's processes host-side, so it needs no tooling
+        in the user's image and is immune to the node's own network/hairpin.
+
+        Only the executable counts, not the arguments: the set-up steps that
+        run before sshd exists (`mkdir -p /run/sshd`, `sed … sshd_config`, the
+        installer's `adduser … sshd`) all mention sshd, and the substring match
+        this replaces reported pods ready that then refused SSH for minutes
+        (external API user, 2026-10)."""
         try:
             result = subprocess.run(  # noqa: S603
                 ["docker", "top", container_id],  # noqa: S607
@@ -297,7 +340,68 @@ class ProcessPodBackend(PodBackend):
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             return False
-        return result.returncode == 0 and "sshd" in result.stdout
+        return result.returncode == 0 and sshd_in_process_list(result.stdout)
+
+    @staticmethod
+    def _container_problem(container_id: str) -> str | None:
+        """The container itself is gone or keeps exiting, or None if it is up.
+        The entrypoint only exits if something kills it (an OOM, say): our
+        `--entrypoint` clears the image's CMD, so a pod otherwise idles in
+        `sleep infinity`."""
+        try:
+            state = subprocess.run(  # noqa: S603
+                ["docker", "inspect", "-f",  # noqa: S607
+                 "{{.State.Running}} {{.State.Restarting}} {{.RestartCount}} {{.State.ExitCode}}", container_id],
+                capture_output=True, text=True, timeout=5.0,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return None
+        if state.returncode != 0:
+            if "No such" in (state.stderr or ""):
+                return "the container is gone (removed outside the platform)"
+            return None
+        words = state.stdout.split()
+        if len(words) < 4:
+            return None
+        running, restarting, restarts, code = words[0], words[1], int(words[2] or 0), words[3]
+        if restarting == "true" or restarts > 0 or running == "false":
+            tail = _last_log_lines(container_id)
+            times = f"restarted {restarts} time(s)" if restarts else "not restarted"
+            return (
+                f"the container exits right after it starts (exit code {code}, {times}), so SSH can't stay up. "
+                f"Last output: {tail}"
+            )
+        return None
+
+    @staticmethod
+    def _ssh_setup_problem(container_id: str) -> str | None:
+        """Why the entrypoint could not bring sshd up in this image, in words
+        for the customer, or None while it still might. Only what the
+        entrypoint logs as final counts: an image with no package manager, or
+        a package install that failed. The entrypoint's own "sshd failed to
+        start" is NOT final (the image's start script may start sshd itself),
+        so that one is left to the timeout."""
+        try:
+            logs = subprocess.run(  # noqa: S603
+                ["docker", "logs", "--tail", "5000", container_id],  # noqa: S607
+                capture_output=True, text=True, timeout=5.0,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return None
+        if logs.returncode != 0:
+            return None
+        output = (logs.stdout or "") + (logs.stderr or "")
+        if "cannot install openssh-server" in output:
+            return (
+                "the SSH server could not be installed in this image (no apt-get, apk, yum or dnf). "
+                "Use an image based on Ubuntu, Debian, Alpine or CentOS/Rocky, or one with openssh-server preinstalled"
+            )
+        if "[greencompute] SSH setup failed" in output:
+            return (
+                "installing the SSH server in this image failed (a package download or mirror error, usually). "
+                "Try again, or use an image with openssh-server preinstalled"
+            )
+        return None
 
     def stop_pod(self, runtime: UnifiedRuntimeRecord) -> UnifiedRuntimeRecord:
         if runtime.container_id:
