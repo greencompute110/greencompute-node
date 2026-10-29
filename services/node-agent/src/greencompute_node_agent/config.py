@@ -96,6 +96,9 @@ class Settings(BaseModel):
     ssh_host: str = "127.0.0.1"
     ssh_port_range_start: int = Field(default=30000, ge=1024)
     ssh_port_range_end: int = Field(default=31000, ge=1025)
+    # How long a starting pod may take to bring sshd up before it fails. A
+    # cold image apt-installs openssh-server first, so minutes, not seconds.
+    pod_ssh_ready_timeout_seconds: float = Field(default=600.0, ge=10)
 
     # Extra TCP ports the user can expose from their pod (apps, databases, APIs).
     # Host-side bindings drawn from this range. Keep separate from SSH range.
@@ -160,6 +163,7 @@ def load_settings() -> Settings:
         ssh_host=os.getenv("GREENCOMPUTE_SSH_HOST", "127.0.0.1"),
         ssh_port_range_start=int(os.getenv("GREENCOMPUTE_SSH_PORT_RANGE_START", "30000")),
         ssh_port_range_end=int(os.getenv("GREENCOMPUTE_SSH_PORT_RANGE_END", "31000")),
+        pod_ssh_ready_timeout_seconds=float(os.getenv("GREENCOMPUTE_POD_SSH_READY_TIMEOUT_SECONDS", "600")),
         user_port_range_start=int(os.getenv("GREENCOMPUTE_USER_PORT_RANGE_START", "31001")),
         user_port_range_end=int(os.getenv("GREENCOMPUTE_USER_PORT_RANGE_END", "32000")),
         disk_enforcement_mode=os.getenv("GREENCOMPUTE_DISK_ENFORCEMENT_MODE") or None,

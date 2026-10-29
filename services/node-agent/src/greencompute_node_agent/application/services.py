@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from greencompute_protocol import (
@@ -275,6 +275,20 @@ class NodeAgentService:
         # (tear down locally, but DON'T report or we'd kill the real pod).
         fleet_deployment_ids = {lease.deployment_id for lease in all_leases}
 
+        # Pods whose container is up but whose SSH server isn't confirmed yet:
+        # one look each per tick, never a blocking wait, which stalled every
+        # other lease on this node for as long as apt-get took.
+        for deployment_id, runtime in self.repository.snapshot_runtime_items():
+            if (
+                deployment_id in active_deployment_ids
+                and runtime.status == "starting"
+                and runtime.current_stage == self.AWAIT_SSH
+            ):
+                try:
+                    self._check_pod_ssh(runtime)
+                except Exception:
+                    logger.exception("SSH check failed for pod %s", deployment_id)
+
         # Start new workloads from leases
         for lease in leases:
             existing = self.repository.get_runtime(lease.deployment_id)
@@ -305,6 +319,8 @@ class NodeAgentService:
                 continue
 
             if existing is not None:
+                if existing.status == "starting" and existing.current_stage == self.AWAIT_SSH:
+                    continue  # container up; SSH is being confirmed each tick (above)
                 # If the runtime was saved but never reached ready/failed, retry it
                 if existing.status in ("accepted", "starting"):
                     # Tear down locally FIRST (release GPUs + stop any launched
@@ -746,31 +762,97 @@ class NodeAgentService:
             self._fail_runtime(runtime, str(exc))
             return
         self._report_progress(runtime, DeploymentState.STARTING)
+        self._finish_pod_start(runtime)
 
-        # Confirm sshd actually came up before reporting the pod ready, so the
-        # customer isn't handed a pod they can't connect to. The check is
-        # host-side (docker), immune to the node's NAT-hairpin (which made the
-        # old public-IP socket check false-negative on every pod). Record the
-        # result on the runtime so a genuine SSH failure is VISIBLE to ops
-        # rather than silently reported ready.
-        ssh_verified = True
-        if hasattr(self.pod_backend, "wait_for_ready"):
-            ssh_verified = self.pod_backend.wait_for_ready(runtime, timeout_seconds=90.0)
-            if not ssh_verified:
-                logger.warning(
-                    "pod %s: sshd not confirmed up within timeout — reporting ready "
-                    "but flagging ssh_verified=false (investigate the image/entrypoint)",
-                    runtime.deployment_id,
-                )
+    #: A starting pod stays in this stage, `starting` to the customer, until
+    #: its SSH server is confirmed. Checked once per reconcile tick.
+    AWAIT_SSH = "await_ssh"
+    _SSH_CHECK_EVERY_SECONDS = 3.0
 
-        # Build endpoint with SSH connection details
+    def _finish_pod_start(self, runtime: UnifiedRuntimeRecord) -> None:
+        """Hand a started pod to the per-tick SSH check, and take the first
+        look right away so a warm image is ready within the same tick.
+
+        Ready means the customer can connect: billing starts at ready, and a
+        pod that refuses SSH isn't what they're paying for. On a cold image the
+        entrypoint first apt-installs openssh-server, which can take minutes;
+        reporting ready after a 90 s timeout anyway (as this did) handed out
+        pods that refused SSH for up to ten minutes (external API user,
+        2026-10). Now the pod stays `starting` until sshd is seen, and if it
+        can't come up at all it fails, unbilled, with the reason."""
+        if not hasattr(self.pod_backend, "ssh_status"):
+            self._report_pod_ready(runtime)
+            return
+        deadline = _utcnow() + timedelta(seconds=self.settings.pod_ssh_ready_timeout_seconds)
+        runtime = runtime.model_copy(update={
+            "status": "starting",
+            "current_stage": self.AWAIT_SSH,
+            "metadata": {**runtime.metadata, "ssh_deadline": deadline.isoformat()},
+            "updated_at": _utcnow(),
+        })
+        self.repository.upsert_runtime(runtime)
+        self._check_pod_ssh(runtime)
+
+    def _check_pod_ssh(self, runtime: UnifiedRuntimeRecord, *, now: datetime | None = None) -> None:
+        """One look at a pod awaiting SSH: report it ready, fail it with the
+        reason, fail it at the deadline, or leave it for the next tick. A few
+        docker calls per look, so at most one look every few seconds."""
+        now = now or _utcnow()
+        checked_at = runtime.metadata.get("ssh_checked_at")
+        if checked_at and (now - datetime.fromisoformat(checked_at)).total_seconds() < self._SSH_CHECK_EVERY_SECONDS:
+            return
+        status, reason = self.pod_backend.ssh_status(runtime)
+        if status == "up":
+            self._report_pod_ready(runtime)
+            return
+        if status == "failed":
+            self._abort_pod(runtime, f"SSH setup failed: {reason}")
+            return
+        deadline = runtime.metadata.get("ssh_deadline")
+        if deadline and now >= datetime.fromisoformat(deadline):
+            minutes = max(1, int(self.settings.pod_ssh_ready_timeout_seconds // 60))
+            self._abort_pod(
+                runtime,
+                f"the SSH server did not come up within {minutes} minutes (the image may be very large, "
+                "or its package mirror slow). Try again, or use an image with openssh-server preinstalled",
+            )
+            return
+        self.repository.upsert_runtime(runtime.model_copy(update={
+            "metadata": {**runtime.metadata, "ssh_checked_at": now.isoformat()},
+        }))
+
+    def _report_pod_ready(self, runtime: UnifiedRuntimeRecord) -> None:
         ssh_endpoint = f"ssh://{runtime.ssh_username}@{runtime.ssh_host}:{runtime.ssh_port}"
         runtime = runtime.model_copy(update={
+            "status": "ready",
+            "current_stage": "ready",
             "endpoint": ssh_endpoint,
-            "metadata": {**runtime.metadata, "ssh_verified": ssh_verified},
+            "updated_at": _utcnow(),
         })
         self.repository.upsert_runtime(runtime)
         self._report_deployment_ready(runtime)
+
+    def _abort_pod(self, runtime: UnifiedRuntimeRecord, error: str) -> None:
+        """A pod whose container is up but that can never be used: remove the
+        container and its disk, then fail the deployment with `error` as the
+        customer sees it. Nothing is billed for a deployment that never became
+        ready."""
+        logger.warning("pod %s: %s", runtime.deployment_id, error)
+        try:
+            self.pod_backend.stop_pod(runtime)
+        except Exception:  # noqa: BLE001 - the failure report matters more than a clean stop
+            logger.exception("could not remove the container of failed pod %s", runtime.deployment_id)
+        volume = self._volume_records.pop(runtime.deployment_id, None)
+        if volume:
+            try:
+                self.volume_manager.delete_volume(volume)
+            except Exception:  # noqa: BLE001
+                logger.exception("could not delete the volume of failed pod %s", runtime.deployment_id)
+        self._fail_runtime(
+            runtime.model_copy(update={"container_id": None, "current_stage": "ssh"}),
+            error,
+            failure_class="pod_start_failure",
+        )
 
     def _start_vm_runtime(self, runtime: UnifiedRuntimeRecord, workload: WorkloadSpec) -> None:
         """Start a VM workload (Firecracker/stub)."""
@@ -853,14 +935,16 @@ class NodeAgentService:
         except ControlPlaneHTTPError:
             logger.exception("failed to report ready for %s", runtime.deployment_id)
 
-    def _fail_runtime(self, runtime: UnifiedRuntimeRecord, error: str) -> None:
+    def _fail_runtime(
+        self, runtime: UnifiedRuntimeRecord, error: str, *, failure_class: str = "workload_dispatch",
+    ) -> None:
         # Release GPU allocation on failure
         self.gpu_allocator.release(runtime.deployment_id)
 
         runtime = runtime.model_copy(update={
             "status": "failed",
             "last_error": error,
-            "failure_class": "workload_dispatch",
+            "failure_class": failure_class,
             "updated_at": _utcnow(),
         })
         self.repository.upsert_runtime(runtime)
