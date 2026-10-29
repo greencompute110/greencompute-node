@@ -58,13 +58,29 @@ def pod_ssh_keys(user_keys: list[str] | None) -> tuple[str | None, list[str]]:
     return private_key, [public_key]
 
 
-def pod_start_env(workload_metadata: dict | None) -> dict[str, str]:
+def pod_start_env(
+    workload_metadata: dict | None,
+    deployment_id: str | None = None,
+    deployment_name: str | None = None,
+) -> dict[str, str]:
     """Container environment for a pod: the workload's `env`, plus its start
     `command` base64-encoded in GC_START_COMMAND_B64 for the entrypoint to run
     (base64 keeps quotes and newlines intact through docker -e). The gateway
-    has already validated both."""
+    has already validated both, and reserves the GC_DEPLOYMENT_* names.
+
+    Every pod also gets GC_DEPLOYMENT_ID and GC_DEPLOYMENT_NAME: the name the
+    renter gave it, else the first 8 characters of its id, so a job can use
+    it as e.g. a mining pool's worker name (an external API user's cards
+    showed up at the pool only as id prefixes, Oct 2026)."""
     meta = workload_metadata or {}
     env = {str(k): str(v) for k, v in (meta.get("env") or {}).items()} if isinstance(meta.get("env"), dict) else {}
+    if deployment_id:
+        env["GC_DEPLOYMENT_ID"] = deployment_id
+        if deployment_name:
+            env["GC_DEPLOYMENT_NAME"] = deployment_name
+        else:
+            # A workload from before these names were reserved may set it itself.
+            env.setdefault("GC_DEPLOYMENT_NAME", deployment_id[:8])
     command = meta.get("command")
     if isinstance(command, str) and command.strip():
         env["GC_START_COMMAND_B64"] = base64.b64encode(command.encode()).decode()
