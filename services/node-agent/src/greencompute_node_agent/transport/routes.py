@@ -192,7 +192,12 @@ def pod_exec(
         raise HTTPException(status_code=409, detail="the pod isn't running")
     if runtime.workload_kind not in ("pod", WorkloadKind.POD):
         raise HTTPException(status_code=409, detail="commands run only in rentals (pods)")
-    return run_in_pod(runtime.container_id, command, timeout_seconds=timeout)
+    from greencompute_node_agent.domain.pod_exec import BusyError
+
+    try:
+        return run_in_pod(runtime.container_id, command, timeout_seconds=timeout)
+    except BusyError as exc:
+        raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": "5"}) from exc
 
 
 @router.get("/pods/{deployment_id}/logs")

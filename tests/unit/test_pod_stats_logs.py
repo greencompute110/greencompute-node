@@ -164,18 +164,57 @@ def test_bounded_output_can_include_stderr():
 from greencompute_node_agent.domain import pod_exec  # noqa: E402
 
 
-def test_a_command_runs_as_root_in_workspace_with_its_exit_code(monkeypatch):
+@pytest.fixture
+def local_pod(monkeypatch, tmp_path):
+    """run_in_pod's docker exec, run here with sh, tmp_path standing in for /workspace."""
     seen = []
+    real = pod_module.run_capped
 
     def run(cmd, **kw):
-        seen.append((cmd, kw))
-        return 3, b"\x1b[31mupdated to 3.8.0\x1b[0m\n", False, False
+        seen.append(cmd)
+        assert cmd[:7] == ["docker", "exec", "-u", "0", "-w", "/workspace", "c1"]
+        local = [part.replace("/workspace", str(tmp_path)) for part in cmd[7:]]
+        return real(local, **kw)
     monkeypatch.setattr(pod_exec, "run_capped", run)
-    out = pod_exec.run_in_pod("c1", "./update.sh", timeout_seconds=999)
-    assert out == {"exit_code": 3, "output": "updated to 3.8.0\n", "output_truncated": False, "timed_out": False}
-    cmd, kw = seen[0]
-    assert cmd == ["docker", "exec", "-u", "0", "-w", "/workspace", "c1", "sh", "-c", "./update.sh"]
-    assert kw["timeout"] == float(pod_exec.MAX_TIMEOUT_SECONDS) and kw["keep"] == pod_exec.KEEP_BYTES
+    return seen, tmp_path
+
+
+@pytest.mark.skipif(shutil.which("sh") is None or shutil.which("tail") is None, reason="needs sh and tail")
+def test_a_command_runs_as_root_in_workspace_and_returns_its_exit_code(local_pod):
+    seen, workspace = local_pod
+    out = pod_exec.run_in_pod("c1", "echo updated to 3.8.0; echo oops >&2; exit 3", timeout_seconds=999)
+    # Exactly what it printed, trailing newline included.
+    assert out == {"exit_code": 3, "output": "updated to 3.8.0\noops\n", "output_truncated": False, "timed_out": False}
+    assert seen[0][7:10] == ["sh", "-c", pod_exec._WRAPPER]  # the command is an argument, never spliced into a script
+    assert list(workspace.iterdir()) == []  # its output file is cleaned up
+
+
+@pytest.mark.skipif(shutil.which("sh") is None or shutil.which("tail") is None, reason="needs sh and tail")
+def test_a_command_that_starts_a_background_job_returns_at_once(local_pod):
+    import time as _time
+
+    started = _time.monotonic()
+    out = pod_exec.run_in_pod("c1", "sleep 3 & echo started", timeout_seconds=30)
+    assert out["exit_code"] == 0 and out["output"] == "started\n" and not out["timed_out"]
+    assert _time.monotonic() - started < 2
+
+
+@pytest.mark.skipif(shutil.which("sh") is None or shutil.which("head") is None, reason="needs sh")
+def test_lots_of_output_is_cut_to_its_end(local_pod):
+    out = pod_exec.run_in_pod("c1", "seq 1 200000; echo last", timeout_seconds=30)
+    assert out["exit_code"] == 0 and out["output"].endswith("200000\nlast\n")
+    assert out["output_truncated"] and len(out["output"]) <= pod_exec.KEEP_BYTES
+
+
+def test_a_busy_machine_says_so(monkeypatch):
+    taken = [pod_exec._SLOTS.acquire(blocking=False) for _ in range(pod_exec.MAX_RUNNING)]
+    try:
+        assert all(taken)
+        with pytest.raises(pod_exec.BusyError):
+            pod_exec.run_in_pod("c1", "true")
+    finally:
+        for _ in taken:
+            pod_exec._SLOTS.release()
 
 
 @pytest.mark.skipif(shutil.which("sh") is None or shutil.which("yes") is None, reason="needs sh and yes")
