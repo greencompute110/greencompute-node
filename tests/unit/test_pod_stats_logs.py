@@ -95,34 +95,32 @@ def test_notes_say_why_a_source_is_empty(monkeypatch):
     assert out["command_log"] is None and "no start command" in out["command_log_note"]
     assert out["container_log"] is None and out["container_log_note"] == "couldn't be read"
     out = pod_logs.collect_pod_logs("c1")
-    assert out["command_log_note"] == "not written yet, or couldn't be read"
+    assert out["command_log_note"] == "not written yet, or couldn't be read (the image needs `tail`)"
     # Lines too long to reach the end of: said, not shown as empty.
     monkeypatch.setattr(pod_logs, "bounded_tail", lambda cmd, **kw: (b"x" * 10, False))
     out = pod_logs.collect_pod_logs("c1", lines=50)
     assert out["container_log"] is None and "too long" in out["container_log_note"]
 
 
-def test_an_image_without_tail_still_gets_its_log_by_docker_cp(monkeypatch):
-    import io
-    import tarfile
+def test_a_failed_gpu_is_named_and_the_others_still_reported(monkeypatch):
+    one_row = SMI.splitlines()[1] + "\n"  # GPU 1 answers, GPU 3 has fallen off the bus
+    monkeypatch.setattr(pod_stats.subprocess, "run", lambda cmd, **kw: SimpleNamespace(
+        returncode=15, stdout=one_row + "Unable to determine the device handle for gpu 0000:41:00.0: Unknown Error\n",
+        stderr=""))
+    gpus = pod_stats.gpu_details([1, 3])
+    assert gpus[0]["uuid"] == "GPU-bbbb" and gpus[0]["util_pct"] == 95.0
+    assert gpus[1] == {"index": 1, "error": "this GPU didn't answer nvidia-smi"}
+    # nvidia-smi failing outright says nothing per card.
+    monkeypatch.setattr(pod_stats.subprocess, "run", lambda cmd, **kw: SimpleNamespace(
+        returncode=9, stdout="NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver.\n", stderr=""))
+    assert pod_stats.gpu_details([1, 3]) == []
 
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tar:
-        data = b"step 1\nstep 2\n"
-        info = tarfile.TarInfo("greencompute-command.log")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-    archive = buf.getvalue()
 
-    def tail(cmd, **kw):
-        if cmd[1] == "exec":
-            return None  # no `tail` in this image
-        if cmd[1] == "cp":
-            assert cmd[2] == f"c1:{pod_logs.COMMAND_LOG}" and cmd[3] == "-"
-            return archive, True
-        return b"", True
-    monkeypatch.setattr(pod_logs, "bounded_tail", tail)
-    assert pod_logs.collect_pod_logs("c1")["command_log"] == "step 1\nstep 2"
+def test_last_lines_in_a_failure_reason_never_come_from_the_middle(monkeypatch):
+    monkeypatch.setattr(pod_module, "bounded_tail", lambda cmd, **kw: (b"x" * 4096, False))
+    assert pod_module._last_log_lines("c1") == "(the last lines are too long to show)"
+    monkeypatch.setattr(pod_module, "bounded_tail", lambda cmd, **kw: (b"\x1b[31mKilled\x1b[0m\n", True))
+    assert pod_module._last_log_lines("c1") == "Killed"
 
 
 def test_terminal_output_reads_as_text():

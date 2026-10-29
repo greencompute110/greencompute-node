@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-import select
+import selectors
 import subprocess
 import time
 from collections.abc import Iterator
@@ -30,7 +30,11 @@ def _last_log_lines(container_id: str, count: int = 5) -> str:
                        keep=4096, read_limit=1024 * 1024, timeout=5.0, merge_stderr=True)
     if got is None:
         return "(unavailable)"
-    text = got[0].decode("utf-8", "replace")
+    if not got[1]:
+        return "(the last lines are too long to show)"
+    from greencompute_node_agent.domain.pod_logs import clean_terminal_text
+
+    text = clean_terminal_text(got[0].decode("utf-8", "replace"))
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return " | ".join(lines[-count:]) or "(none)"
 
@@ -56,8 +60,7 @@ def bounded_tail(cmd: list[str], *, keep: int, read_limit: int, timeout: float,
             left = deadline - time.monotonic()
             if left <= 0:
                 return None
-            ready, _, _ = select.select([proc.stdout], [], [], left)
-            if not ready:
+            if not _readable(proc.stdout, left):
                 return None
             chunk = os.read(proc.stdout.fileno(), 65536)
             if not chunk:
@@ -84,6 +87,14 @@ def bounded_tail(cmd: list[str], *, keep: int, read_limit: int, timeout: float,
         proc.stdout.close()
 
 
+def _readable(stream, timeout: float) -> bool:
+    """Whether `stream` has data (or EOF) within `timeout`. A selector, not
+    select.select, which fails for file descriptors above 1024."""
+    with selectors.DefaultSelector() as sel:
+        sel.register(stream, selectors.EVENT_READ)
+        return bool(sel.select(timeout))
+
+
 def bounded_output(cmd: list[str], *, limit: int, timeout: float, merge_stderr: bool = False) -> bytes | None:
     """stdout of `cmd` (and its stderr, with `merge_stderr`), or None if it
     fails, takes longer than `timeout`, or prints more than `limit` bytes.
@@ -102,8 +113,7 @@ def bounded_output(cmd: list[str], *, limit: int, timeout: float, merge_stderr: 
             left = deadline - time.monotonic()
             if left <= 0:
                 return None
-            ready, _, _ = select.select([proc.stdout], [], [], left)
-            if not ready:
+            if not _readable(proc.stdout, left):
                 return None
             chunk = os.read(proc.stdout.fileno(), 65536)
             if not chunk:

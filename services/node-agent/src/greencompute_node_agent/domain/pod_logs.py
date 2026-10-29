@@ -12,9 +12,8 @@ aren't confused.
 """
 from __future__ import annotations
 
-import io
 import re
-import tarfile
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from greencompute_node_agent.domain.pod import bounded_tail
@@ -23,8 +22,8 @@ COMMAND_LOG = "/workspace/greencompute-command.log"
 MAX_LINES = 2000
 #: How much of each source's end is kept.
 KEEP_BYTES = 256 * 1024
-#: docker cp of the command log (images without `tail`) reads at most this.
-COPY_READ_LIMIT = 64 * 1024 * 1024
+#: Both sources are read side by side (a reply well within the gateway's wait).
+_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pod-logs")
 
 _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -47,47 +46,33 @@ def _last_lines(raw: bytes, lines: int) -> str:
     return "\n".join(clean_terminal_text(raw.decode("utf-8", "replace")).splitlines()[-lines:])
 
 
-def _command_log_via_copy(container_id: str) -> tuple[bytes, bool] | None:
-    """The log's end by `docker cp` (a tar stream from the daemon: works
-    whatever the image has inside). The tar's padding is cut off."""
-    got = bounded_tail(["docker", "cp", f"{container_id}:{COMMAND_LOG}", "-"],
-                       keep=KEEP_BYTES + 2048, read_limit=COPY_READ_LIMIT, timeout=10.0)
-    if got is None:
-        return None
-    data, complete = got
-    if complete and len(data) < KEEP_BYTES:  # the whole archive: read it properly
-        try:
-            with tarfile.open(fileobj=io.BytesIO(data)) as tar:
-                member = tar.next()
-                if member is None or not member.isfile():
-                    return None
-                extracted = tar.extractfile(member)
-                return (extracted.read() if extracted else b""), True
-        except tarfile.TarError:
-            return None
-    return data.rstrip(b"\x00"), complete
+def _command_log(container_id: str) -> tuple[bytes, bool] | None:
+    # As root: the log is root's, whatever the image's USER. Only its end
+    # is read (tail seeks), and only that much is kept.
+    return bounded_tail(["docker", "exec", "-u", "0", container_id, "tail", "-c", str(KEEP_BYTES), COMMAND_LOG],
+                        keep=KEEP_BYTES, read_limit=KEEP_BYTES * 2, timeout=5.0)
+
+
+def _container_log(container_id: str, lines: int) -> tuple[bytes, bool] | None:
+    return bounded_tail(["docker", "logs", "--tail", str(lines), container_id],
+                        keep=KEEP_BYTES, read_limit=64 * 1024 * 1024, timeout=6.0, merge_stderr=True)
 
 
 def collect_pod_logs(container_id: str, *, lines: int = 200, has_command: bool = True) -> dict[str, Any]:
     lines = max(1, min(int(lines), MAX_LINES))
     out: dict[str, Any] = {"lines": lines, "command_log": None, "command_log_note": None,
                            "container_log": None, "container_log_note": None}
-    if not has_command:
+    command_f = _POOL.submit(_command_log, container_id) if has_command else None
+    container_f = _POOL.submit(_container_log, container_id, lines)
+    if command_f is None:
         out["command_log_note"] = "this rental has no start command (metadata.command)"
     else:
-        # As root: the log is root's, whatever the image's USER.
-        got = bounded_tail(["docker", "exec", "-u", "0", container_id, "tail", "-c", str(KEEP_BYTES), COMMAND_LOG],
-                           keep=KEEP_BYTES, read_limit=KEEP_BYTES * 2, timeout=5.0)
+        got = command_f.result()
         if got is None:
-            got = _command_log_via_copy(container_id)
-        if got is None:
-            out["command_log_note"] = "not written yet, or couldn't be read"
+            out["command_log_note"] = "not written yet, or couldn't be read (the image needs `tail`)"
         else:
             out["command_log"] = _last_lines(got[0], lines)
-            if not got[1]:
-                out["command_log_note"] = "the log is too large to find its end; it is cut to size within a minute"
-    got = bounded_tail(["docker", "logs", "--tail", str(lines), container_id],
-                       keep=KEEP_BYTES, read_limit=64 * 1024 * 1024, timeout=8.0, merge_stderr=True)
+    got = container_f.result()
     if got is None:
         out["container_log_note"] = "couldn't be read"
     elif not got[1]:

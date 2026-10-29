@@ -11,9 +11,14 @@ import json
 import logging
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+#: Shared by every stats request (three probes each), not a pool per request.
+_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="pod-stats")
+PROBE_TIMEOUT = 4.0
 
 
 def collect_pod_stats(
@@ -22,16 +27,14 @@ def collect_pod_stats(
     workspace_path: str = "/workspace",
 ) -> dict[str, Any]:
     """The three probes run side by side: the slowest one, not their sum
-    (docker stats alone takes about 2 s), bounds a reading."""
-    from concurrent.futures import ThreadPoolExecutor
-
-    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="pod-stats") as pool:
-        docker_f = pool.submit(_docker_stats, container_id)
-        gpus_f = pool.submit(gpu_details, gpu_device_ids)
-        disk_f = pool.submit(_disk_usage, container_id, workspace_path)
-        cpu_pct, mem_used, mem_limit, net_rx, net_tx = docker_f.result()
-        gpus = gpus_f.result()
-        disk_used, disk_total = disk_f.result()
+    (docker stats alone takes about 2 s), bounds a reading, and each gives
+    up after 4 s, inside the gateway's 6 s wait."""
+    docker_f = _POOL.submit(_docker_stats, container_id)
+    gpus_f = _POOL.submit(gpu_details, gpu_device_ids)
+    disk_f = _POOL.submit(_disk_usage, container_id, workspace_path)
+    cpu_pct, mem_used, mem_limit, net_rx, net_tx = docker_f.result()
+    gpus = gpus_f.result()
+    disk_used, disk_total = disk_f.result()
 
     out: dict[str, Any] = {}
     if cpu_pct is not None:
@@ -104,13 +107,13 @@ def gpu_details(device_ids: list[int] | None) -> list[dict[str, Any]]:
         "--query-gpu=" + ",".join(field for field, _ in _GPU_QUERY),
         "--format=csv,noheader,nounits",
     ]
+    order = {d: i for i, d in enumerate(sorted(device_ids))}
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5.0)  # noqa: S603
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=PROBE_TIMEOUT)  # noqa: S603
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
-    if r.returncode != 0:
-        return []
-    order = {d: i for i, d in enumerate(sorted(device_ids))}
+    # A card that has failed makes nvidia-smi exit with an error but still
+    # print the others: keep those, and name the one that didn't answer.
     gpus: list[dict[str, Any]] = []
     for line in r.stdout.strip().splitlines():
         parts = [p.strip() for p in line.split(",")]
@@ -126,6 +129,12 @@ def gpu_details(device_ids: list[int] | None) -> list[dict[str, Any]]:
         for (field, key), value in zip(_GPU_QUERY[1:], parts[1:]):
             gpu[key] = value if field in _TEXT_FIELDS else _number(value)
         gpus.append(gpu)
+    if not gpus and r.returncode != 0:
+        return []  # nvidia-smi itself isn't working: nothing to say per card
+    answered = {g["index"] for g in gpus}
+    for host_index, pod_index in order.items():
+        if pod_index not in answered:
+            gpus.append({"index": pod_index, "error": "this GPU didn't answer nvidia-smi"})
     return sorted(gpus, key=lambda g: g["index"])
 
 
@@ -140,7 +149,7 @@ def _docker_stats(container_id: str) -> tuple[float | None, float | None, float 
             ],
             capture_output=True,
             text=True,
-            timeout=8.0,
+            timeout=PROBE_TIMEOUT,
         )
         if r.returncode != 0 or not r.stdout.strip():
             return None, None, None, None, None
@@ -158,7 +167,7 @@ def _disk_usage(container_id: str, path: str) -> tuple[float | None, float | Non
     comes from the renter's image, so it is read with a size cap."""
     from greencompute_node_agent.domain.pod import bounded_output
 
-    raw = bounded_output(["docker", "exec", container_id, "df", "-B1", path], limit=16384, timeout=5.0)
+    raw = bounded_output(["docker", "exec", container_id, "df", "-B1", path], limit=16384, timeout=PROBE_TIMEOUT)
     if raw is None:
         return None, None
     # Filesystem     1B-blocks       Used Available Use% Mounted on
