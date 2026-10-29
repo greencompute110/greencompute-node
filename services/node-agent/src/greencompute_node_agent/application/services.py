@@ -427,7 +427,10 @@ class NodeAgentService:
             # A distributed replica's rank role arrives on the LEASE (each rank
             # shares one workload but has its own role/rank/head_host). Stash it
             # so _start_inference_runtime can hand it to the launcher.
-            metadata={"multi_node": lease.multi_node} if lease.multi_node else {},
+            metadata={
+                **({"multi_node": lease.multi_node} if lease.multi_node else {}),
+                **({"deployment_name": lease.deployment_name} if getattr(lease, "deployment_name", None) else {}),
+            },
         )
         self.repository.upsert_runtime(runtime)
 
@@ -744,7 +747,9 @@ class NodeAgentService:
                 "ssh_public_keys": ssh_public_keys,
                 "ssh_private_key": private_key,
                 # The workload's env vars and start command (docker -e).
-                "env_vars": pod_start_env(workload.metadata),
+                "env_vars": pod_start_env(
+                    workload.metadata, runtime.deployment_id, runtime.metadata.get("deployment_name"),
+                ),
                 "gpu_devices": gpu_devices,
                 "gpu_count": gpu_count,
                 "port_allocations": port_allocations,

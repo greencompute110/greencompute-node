@@ -72,3 +72,40 @@ def test_no_command_does_nothing(tmp_path):
         timeout=10,
     )
     assert not (tmp_path / "w").exists()
+
+
+# --- the deployment's name reaches the pod (#27) ------------------------------
+
+def test_every_pod_gets_its_id_and_name():
+    env = pod_start_env({"env": {"POOL": "x"}}, "0123456789ab-cdef", "rig-07")
+    assert env == {"POOL": "x", "GC_DEPLOYMENT_ID": "0123456789ab-cdef", "GC_DEPLOYMENT_NAME": "rig-07"}
+
+
+def test_without_a_name_the_short_id_is_used():
+    assert pod_start_env({}, "0123456789ab-cdef")["GC_DEPLOYMENT_NAME"] == "01234567"
+
+
+def test_the_lease_name_is_kept_on_the_runtime_for_the_pod(monkeypatch):
+    from types import SimpleNamespace
+
+    from greencompute_node_agent.application.services import NodeAgentService
+    from greencompute_protocol import LeaseAssignment, WorkloadKind, WorkloadSpec
+
+    svc = object.__new__(NodeAgentService)
+    workload = WorkloadSpec(name="miner", image="img", kind="pod")
+    svc.control_plane = SimpleNamespace(get_workload=lambda wid: workload)
+    svc.repository = SimpleNamespace(upsert_runtime=lambda rt: rt)
+    started = {}
+    monkeypatch.setattr(NodeAgentService, "_start_pod_runtime",
+                        lambda self, runtime, wl: started.setdefault("runtime", runtime))
+    lease = LeaseAssignment(deployment_id="d1", workload_id=workload.workload_id, hotkey="h", node_id="n",
+                            deployment_name="rig-07")
+    svc._reconcile_workload(lease)
+    assert started["runtime"].metadata["deployment_name"] == "rig-07"
+    assert started["runtime"].workload_kind == WorkloadKind.POD
+
+
+def test_a_workload_set_name_is_kept_unless_the_rental_has_its_own():
+    meta = {"env": {"GC_DEPLOYMENT_NAME": "from-workload"}}
+    assert pod_start_env(meta, "0123456789ab")["GC_DEPLOYMENT_NAME"] == "from-workload"
+    assert pod_start_env(meta, "0123456789ab", "rig-07")["GC_DEPLOYMENT_NAME"] == "rig-07"
