@@ -10,6 +10,7 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from greencompute_protocol import (
+    WorkloadKind,
     CapacityUpdate,
     Heartbeat,
     MinerRegistration,
@@ -167,6 +168,31 @@ def inference_healthz(
     if runtime is None or runtime.status != "ready" or not runtime.runtime_url:
         raise HTTPException(status_code=503, detail="not ready")
     return {"status": "ok", "deployment_id": deployment_id}
+
+
+@router.post("/pods/{deployment_id}/exec")
+def pod_exec(
+    deployment_id: str,
+    body: dict,
+    x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
+) -> dict:
+    """Run a command in the pod, as root, from /workspace: {command,
+    timeout_seconds (1-120)}. Only with the node secret (sensitive)."""
+    validate_auth(x_agent_auth, _cfg(), sensitive=True)
+    from greencompute_node_agent.domain.pod_exec import MAX_COMMAND_CHARS, MAX_TIMEOUT_SECONDS, run_in_pod
+
+    command = body.get("command") if isinstance(body, dict) else None
+    if not isinstance(command, str) or not command.strip() or len(command) > MAX_COMMAND_CHARS or "\x00" in command:
+        raise HTTPException(status_code=400, detail=f"command must be 1-{MAX_COMMAND_CHARS} characters")
+    timeout = body.get("timeout_seconds", 60)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= MAX_TIMEOUT_SECONDS:
+        raise HTTPException(status_code=400, detail=f"timeout_seconds must be 1-{MAX_TIMEOUT_SECONDS}")
+    runtime = _svc().repository.get_runtime(deployment_id)
+    if runtime is None or not runtime.container_id or runtime.status != "ready":
+        raise HTTPException(status_code=409, detail="the pod isn't running")
+    if runtime.workload_kind not in ("pod", WorkloadKind.POD):
+        raise HTTPException(status_code=409, detail="commands run only in rentals (pods)")
+    return run_in_pod(runtime.container_id, command, timeout_seconds=timeout)
 
 
 @router.get("/pods/{deployment_id}/logs")

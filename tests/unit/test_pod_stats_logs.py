@@ -157,3 +157,37 @@ def test_bounded_output_can_include_stderr():
     assert pod_module.bounded_output(["sh", "-c", "echo out; echo err >&2"], limit=100, timeout=5,
                                      merge_stderr=True) == b"out\nerr\n"
     assert pod_module.bounded_output(["sh", "-c", "echo out; echo err >&2"], limit=100, timeout=5) == b"out\n"
+
+
+# --- running a command in a pod (request #32) ---------------------------------
+
+from greencompute_node_agent.domain import pod_exec  # noqa: E402
+
+
+def test_a_command_runs_as_root_in_workspace_with_its_exit_code(monkeypatch):
+    seen = []
+
+    def run(cmd, **kw):
+        seen.append((cmd, kw))
+        return 3, b"\x1b[31mupdated to 3.8.0\x1b[0m\n", False, False
+    monkeypatch.setattr(pod_exec, "run_capped", run)
+    out = pod_exec.run_in_pod("c1", "./update.sh", timeout_seconds=999)
+    assert out == {"exit_code": 3, "output": "updated to 3.8.0\n", "output_truncated": False, "timed_out": False}
+    cmd, kw = seen[0]
+    assert cmd == ["docker", "exec", "-u", "0", "-w", "/workspace", "c1", "sh", "-c", "./update.sh"]
+    assert kw["timeout"] == float(pod_exec.MAX_TIMEOUT_SECONDS) and kw["keep"] == pod_exec.KEEP_BYTES
+
+
+@pytest.mark.skipif(shutil.which("sh") is None or shutil.which("yes") is None, reason="needs sh and yes")
+def test_run_capped_keeps_the_end_reports_exit_codes_and_gives_up_at_the_deadline():
+    import time as _time
+
+    code, out, dropped, timed_out = pod_module.run_capped(["sh", "-c", "seq 1 100000; exit 4"], keep=20, timeout=5)
+    assert (code, dropped, timed_out) == (4, True, False) and out.endswith(b"100000\n") and len(out) == 20
+    code, out, dropped, timed_out = pod_module.run_capped(["sh", "-c", "echo hi"], keep=100, timeout=5)
+    assert (code, out, dropped, timed_out) == (0, b"hi\n", False, False)
+    started = _time.monotonic()
+    code, out, dropped, timed_out = pod_module.run_capped(["sh", "-c", "echo start; sleep 5"], keep=100, timeout=0.5)
+    assert code is None and timed_out and out == b"start\n" and _time.monotonic() - started < 2
+    code, out, _, timed_out = pod_module.run_capped(["yes"], keep=10, timeout=0.5)
+    assert timed_out and len(out) == 10  # endless output: capped, then stopped at the deadline

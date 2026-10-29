@@ -39,6 +39,43 @@ def _last_log_lines(container_id: str, count: int = 5) -> str:
     return " | ".join(lines[-count:]) or "(none)"
 
 
+def run_capped(cmd: list[str], *, keep: int, timeout: float) -> tuple[int | None, bytes, bool, bool]:
+    """Run `cmd` (stderr into stdout), keeping only the last `keep` bytes of
+    its output. Returns (exit code or None, kept output, whether earlier
+    output was dropped, whether it timed out). For a command the renter runs
+    in their own pod, so like bounded_tail it never holds more than `keep`
+    and a chunk, whatever it prints."""
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)  # noqa: S603
+    except OSError:
+        return None, b"", False, False
+    deadline = time.monotonic() + timeout
+    tail = bytearray()
+    dropped = False
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or not _readable(proc.stdout, left):
+                return None, bytes(tail), dropped, True
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            tail += chunk
+            if len(tail) > keep:
+                del tail[:len(tail) - keep]
+                dropped = True
+        try:
+            code = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            return None, bytes(tail), dropped, True
+        return code, bytes(tail), dropped, False
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
+
+
 def bounded_tail(cmd: list[str], *, keep: int, read_limit: int, timeout: float,
                  merge_stderr: bool = False) -> tuple[bytes, bool] | None:
     """The last `keep` bytes `cmd` prints, and whether it finished within
