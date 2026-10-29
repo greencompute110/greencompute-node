@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import select
 import subprocess
 import time
 from collections.abc import Iterator
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from greencompute_protocol import UnifiedRuntimeRecord, WorkloadSpec
+from greencompute_protocol.ssh_host_keys import clean_ssh_host_keys
 from greencompute_node_agent.domain.disk import DiskMode
 from greencompute_node_agent.domain.gpu_docker import gpu_docker_flags
 
@@ -33,6 +35,43 @@ def _last_log_lines(container_id: str, count: int = 5) -> str:
         return "(unavailable)"
     lines = [line.strip() for line in ((logs.stdout or "") + (logs.stderr or "")).splitlines() if line.strip()]
     return " | ".join(lines[-count:]) or "(none)"
+
+
+def bounded_output(cmd: list[str], *, limit: int, timeout: float) -> bytes | None:
+    """stdout of `cmd`, or None if it fails, takes longer than `timeout`, or
+    prints more than `limit` bytes. For commands run inside a renter's
+    container, whose output they control: subprocess.run would hold all of it
+    in this process's memory before any cap could apply."""
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)  # noqa: S603
+    except OSError:
+        return None
+    deadline = time.monotonic() + timeout
+    data = bytearray()
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            ready, _, _ = select.select([proc.stdout], [], [], left)
+            if not ready:
+                return None
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > limit:
+                return None
+        try:
+            code = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            return None
+        return bytes(data) if code == 0 else None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
 
 
 def sshd_in_process_list(docker_top_output: str) -> bool:
@@ -186,6 +225,11 @@ class ProcessPodBackend(PodBackend):
         if ssh_public_keys:
             keys_str = "\n".join(ssh_public_keys)
             cmd += ["-e", f"AUTHORIZED_KEYS={keys_str}"]
+        # A new container makes SSH host keys of its own on first boot
+        # (entrypoint fresh_host_keys), instead of using any baked into the
+        # image, which every pod of that image would share. After the user's
+        # env, so it can't be turned off.
+        cmd += ["-e", "GC_NEW_HOST_KEYS=1"]
 
         # Mount the SSH bootstrap entrypoint and override the container entrypoint.
         # This injects sshd into any image (Vast.ai / RunPod style).
@@ -319,6 +363,28 @@ class ProcessPodBackend(PodBackend):
         if problem:
             return "failed", problem
         return "pending", None
+
+    #: Prints the .pub of each host key sshd is configured to serve (`sshd
+    #: -T` resolves sshd_config and its includes), or of the usual ones if
+    #: that can't be read (sshd -T needs root, so an image's non-root USER).
+    HOST_KEYS_SCRIPT = (
+        'sshd=$(command -v sshd || echo /usr/sbin/sshd); '
+        'keys=$("$sshd" -T 2>/dev/null | awk \'$1 == "hostkey" {print $2}\'); '
+        '[ -n "$keys" ] || keys="/etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ecdsa_key /etc/ssh/ssh_host_rsa_key"; '
+        'for f in $keys; do cat "$f.pub" 2>/dev/null; done; true'
+    )
+
+    def ssh_host_keys(self, runtime: UnifiedRuntimeRecord) -> list[str]:
+        """The pod's SSH host public keys as `type base64`, or [] if none
+        could be read. Renters check them instead of turning host-key checking
+        off when a host port they used before comes back with a new pod. The
+        output comes from the renter's container, so it is read with a size
+        cap on this side: an image could make `cat` print without end."""
+        container = runtime.container_id
+        if not container:
+            return []
+        out = bounded_output(["docker", "exec", container, "sh", "-c", self.HOST_KEYS_SCRIPT], limit=65536, timeout=5.0)
+        return clean_ssh_host_keys(out.decode("utf-8", "replace")) if out is not None else []
 
     @staticmethod
     def _sshd_running(container_id: str) -> bool:

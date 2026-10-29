@@ -826,9 +826,26 @@ class NodeAgentService:
             "metadata": {**runtime.metadata, "ssh_checked_at": now.isoformat()},
         }))
 
+    def _with_host_keys(self, runtime: UnifiedRuntimeRecord) -> UnifiedRuntimeRecord:
+        """`runtime` with its pod's SSH host keys in metadata, sent with every
+        ready report so the API can publish them. Reading none (the pod
+        couldn't be asked, or had nothing readable) changes nothing: the keys
+        already known stay, and the control plane keeps what it has."""
+        read = getattr(self.pod_backend, "ssh_host_keys", None)
+        if read is None:
+            return runtime
+        try:
+            keys = list(read(runtime) or [])
+        except Exception:  # noqa: BLE001 - never hold up a ready report for this
+            logger.exception("could not read the SSH host keys of pod %s", runtime.deployment_id)
+            keys = []
+        if not keys:
+            return runtime
+        return runtime.model_copy(update={"metadata": {**runtime.metadata, "ssh_host_keys": keys}})
+
     def _report_pod_ready(self, runtime: UnifiedRuntimeRecord) -> None:
         ssh_endpoint = f"ssh://{runtime.ssh_username}@{runtime.ssh_host}:{runtime.ssh_port}"
-        runtime = runtime.model_copy(update={
+        runtime = self._with_host_keys(runtime).model_copy(update={
             "status": "ready",
             "current_stage": "ready",
             "endpoint": ssh_endpoint,
@@ -935,6 +952,7 @@ class NodeAgentService:
                 endpoint=runtime.endpoint,
                 ssh_private_key=runtime.metadata.get("ssh_private_key"),
                 port_mappings=runtime.port_mappings or None,
+                ssh_host_keys=runtime.metadata.get("ssh_host_keys"),
                 ready_instances=1,
             ))
         except ControlPlaneHTTPError:
@@ -1130,6 +1148,11 @@ class NodeAgentService:
                 })
                 self.repository.upsert_runtime(runtime)
                 return
+            # Same container, same keys. Only a pod that started before keys
+            # were reported is asked now (it never gets new ones, so there is
+            # no race with the entrypoint making them).
+            if not runtime.metadata.get("ssh_host_keys"):
+                runtime = self._with_host_keys(runtime)
             self.repository.upsert_runtime(runtime)
             self._report_deployment_ready(runtime)
             return

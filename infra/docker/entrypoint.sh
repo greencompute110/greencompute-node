@@ -24,6 +24,38 @@ install_ssh() {
     fi
 }
 
+# --- A pod's own SSH host keys ---
+# An image with openssh-server preinstalled carries the host keys made when
+# the image was built, the same in every pod of that image, so anyone renting
+# that image held this pod's private host key. A new container (the node
+# starts them with GC_NEW_HOST_KEYS=1 since 30 Oct 2026) replaces them once.
+# The marker holds the container's id (its kernel hostname), so the keys stay
+# put across restarts and resumes of this container, while a pod saved as an
+# image and started again still gets new ones. New keys are made aside first:
+# if that fails, the old keys stay and SSH still works. Pods started before
+# keep the keys their renters have already seen.
+# Arguments: root (only the tests pass one), container id.
+fresh_host_keys() {
+    local root="${1:-}" id="${2:-}"
+    [ "${GC_NEW_HOST_KEYS:-}" = "1" ] && [ -n "$id" ] || return 0
+    local dir="$root/etc/ssh"
+    local marker="$dir/.greencompute-host-keys"
+    [ "$(cat "$marker" 2>/dev/null)" = "$id" ] && return 0
+    local tmp
+    tmp=$(mktemp -d 2>/dev/null) || return 1
+    mkdir -p "$tmp/etc/ssh" "$dir"
+    ssh-keygen -A -f "$tmp" >/dev/null 2>&1
+    # ssh-keygen -A exits 0 even when it saved nothing.
+    if ! ls "$tmp"/etc/ssh/ssh_host_*_key >/dev/null 2>&1; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -f "$dir"/ssh_host_*_key "$dir"/ssh_host_*_key.pub
+    mv "$tmp"/etc/ssh/ssh_host_* "$dir"/ || return 1
+    rm -rf "$tmp"
+    printf '%s\n' "$id" > "$marker"
+}
+
 configure_ssh() {
     mkdir -p /run/sshd /root/.ssh
     chmod 700 /root/.ssh
@@ -34,7 +66,9 @@ configure_ssh() {
         chmod 600 /root/.ssh/authorized_keys
     fi
 
-    # Generate host keys if missing
+    # Host keys: new ones for a new pod, then any still missing.
+    fresh_host_keys "" "$(cat /proc/sys/kernel/hostname 2>/dev/null)" \
+        || echo "[greencompute] WARN: could not make new SSH host keys; keeping the image's" >&2
     ssh-keygen -A 2>/dev/null || true
 
     # Configure sshd: root login, KEY-ONLY auth (no passwords), port 22.
@@ -92,7 +126,7 @@ persist_image_env() {
     local etcenv="${GC_ETC_ENV_FILE:-/etc/environment}"
     local etcnew="${etcenv}.greencompute.$$"
     local names=" "
-    local skip='^(HOSTNAME|HOME|PWD|OLDPWD|SHLVL|TERM|_|SHELL|USER|LOGNAME|MAIL|AUTHORIZED_KEYS|GC_START_COMMAND_B64)$'
+    local skip='^(HOSTNAME|HOME|PWD|OLDPWD|SHLVL|TERM|_|SHELL|USER|LOGNAME|MAIL|AUTHORIZED_KEYS|GC_START_COMMAND_B64|GC_NEW_HOST_KEYS)$'
     mkdir -p "$(dirname "$profile")" "$(dirname "$sshenv")"
     : > "$profile"
     : > "$sshenv"

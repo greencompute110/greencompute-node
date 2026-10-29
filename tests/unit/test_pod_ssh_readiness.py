@@ -7,6 +7,7 @@ still installing openssh-server (a 90 s timeout that then reported ready
 anyway), and the check matched "sshd" anywhere in the process list, which
 the set-up steps (`mkdir -p /run/sshd`, `sed … sshd_config`) also do.
 """
+import shutil
 import subprocess
 from datetime import timedelta
 from types import SimpleNamespace
@@ -14,8 +15,10 @@ from types import SimpleNamespace
 import pytest
 
 from greencompute_node_agent.application.services import NodeAgentService, _utcnow
+from greencompute_node_agent.domain import pod as pod_module
 from greencompute_node_agent.domain.pod import ProcessPodBackend, sshd_in_process_list
 from greencompute_protocol import DeploymentState, UnifiedRuntimeRecord, WorkloadKind
+from greencompute_protocol.ssh_host_keys import clean_ssh_host_keys
 
 HEADER = "UID PID PPID C STIME TTY TIME CMD\n"
 
@@ -242,3 +245,146 @@ def test_a_backend_without_ssh_reports_ready_directly():
     svc._finish_pod_start(_pod_runtime())
     [update] = svc.control_plane.updates
     assert update.state == DeploymentState.READY
+
+
+# --- the pod's SSH host keys go out with the ready report (request #9) --------
+
+ED = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFDpfaWJh7dYs3/G3VaELhN36Tj0pY7oUj+Afdy7rk93"
+EC = ("ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEbBtMZtLYqFI5v+Dgiy8Hpi5QQd"
+      "8pxTsAiqLATbh2bTDlNRKAcOaPO6FkAzthlAm4jQrj+KCUW2Ou65ZDcBAs8=")
+
+
+def test_host_keys_are_read_with_one_exec_and_cleaned(monkeypatch):
+    seen = []
+
+    def _out(cmd, **kwargs):
+        seen.append((cmd, kwargs))
+        return f"{ED} root@c1\n{EC} root@c1\n".encode()
+    monkeypatch.setattr(pod_module, "bounded_output", _out)
+    assert ProcessPodBackend().ssh_host_keys(_rt()) == [ED, EC]
+    assert seen == [(["docker", "exec", "c1", "sh", "-c", ProcessPodBackend.HOST_KEYS_SCRIPT],
+                     {"limit": 65536, "timeout": 5.0})]
+
+
+def test_no_keys_when_the_pod_cannot_be_asked(monkeypatch):
+    monkeypatch.setattr(pod_module, "bounded_output", lambda cmd, **kw: None)
+    assert ProcessPodBackend().ssh_host_keys(_rt()) == []
+    assert ProcessPodBackend().ssh_host_keys(_rt(container=None)) == []
+    monkeypatch.setattr(pod_module, "bounded_output", lambda cmd, **kw: b"junk\n")
+    assert ProcessPodBackend().ssh_host_keys(_rt()) == []
+
+
+# The output comes from the renter's container: it must never fill our memory.
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="needs sh")
+def test_bounded_output_returns_what_a_quick_command_prints():
+    assert pod_module.bounded_output(["sh", "-c", "echo hi"], limit=100, timeout=5) == b"hi\n"
+
+
+@pytest.mark.skipif(shutil.which("yes") is None, reason="needs yes")
+def test_bounded_output_stops_reading_endless_output():
+    import time as _time
+
+    started = _time.monotonic()
+    assert pod_module.bounded_output(["yes"], limit=65536, timeout=5) is None
+    assert _time.monotonic() - started < 2
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="needs sh")
+def test_bounded_output_gives_up_at_the_timeout_and_on_failure():
+    assert pod_module.bounded_output(["sh", "-c", "sleep 5"], limit=100, timeout=0.3) is None
+    assert pod_module.bounded_output(["sh", "-c", "echo x; exit 3"], limit=100, timeout=5) is None
+    assert pod_module.bounded_output(["/nonexistent/binary"], limit=100, timeout=5) is None
+
+
+@pytest.mark.skipif(shutil.which("sh") is None or shutil.which("awk") is None, reason="needs sh and awk")
+def test_the_script_lists_the_keys_sshd_is_configured_with(tmp_path):
+    """`sshd -T` names the keys sshd serves, wherever sshd_config puts them."""
+    keys = tmp_path / "keys"
+    keys.mkdir()
+    (keys / "host_ed25519.pub").write_text(f"{ED} root@c1\n")
+    (keys / "host_ecdsa.pub").write_text(f"{EC} root@c1\n")
+    fake_sshd = tmp_path / "bin" / "sshd"
+    fake_sshd.parent.mkdir()
+    fake_sshd.write_text(f"#!/bin/sh\necho port 22\necho hostkey {keys}/host_ed25519\n"
+                         f"echo hostkey {keys}/host_ecdsa\necho hostkey {keys}/missing\n")
+    fake_sshd.chmod(0o755)
+    out = subprocess.run(["sh", "-c", ProcessPodBackend.HOST_KEYS_SCRIPT], capture_output=True, text=True,
+                         env={"PATH": f"{fake_sshd.parent}:/usr/bin:/bin"}, timeout=10)
+    assert out.returncode == 0
+    assert clean_ssh_host_keys(out.stdout) == [ED, EC]
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="needs sh")
+def test_the_script_still_succeeds_without_sshd(tmp_path):
+    out = subprocess.run(["sh", "-c", ProcessPodBackend.HOST_KEYS_SCRIPT], capture_output=True, text=True,
+                         env={"PATH": "/nonexistent:/usr/bin:/bin"}, timeout=10)
+    assert out.returncode == 0  # falls back to the usual files; whatever exists is printed
+
+
+def test_ready_report_carries_the_host_keys():
+    svc = _agent(("up", None))
+    svc.pod_backend.ssh_host_keys = lambda rt: [ED]
+    svc._finish_pod_start(_pod_runtime())
+    [update] = svc.control_plane.updates
+    assert update.ssh_host_keys == [ED]
+    assert svc.repository.runtimes["d1"].metadata["ssh_host_keys"] == [ED]
+
+
+def test_a_resumed_pod_whose_keys_are_known_is_not_asked_again():
+    svc = _agent(("up", None))
+    svc.gpu_allocator = SimpleNamespace(allocate_specific=lambda dep, devices: devices, release=lambda dep: None)
+    svc.pod_backend.resume_pod = lambda rt: rt.model_copy(update={"status": "ready", "current_stage": "ready"})
+    asked = []
+    svc.pod_backend.ssh_host_keys = lambda rt: asked.append(rt) or [EC]
+    suspended = _pod_runtime().model_copy(update={
+        "status": "suspended", "metadata": {"gpu_devices": [0], "gpu_count": 1, "ssh_host_keys": [ED]},
+    })
+    svc._resume_runtime(suspended)
+    [update] = svc.control_plane.updates
+    assert update.ssh_host_keys == [ED] and asked == []
+
+
+def test_a_failure_to_read_keys_never_holds_up_ready():
+    svc = _agent(("up", None))
+
+    def _boom(rt):
+        raise RuntimeError("docker exec hung")
+    svc.pod_backend.ssh_host_keys = _boom
+    svc._finish_pod_start(_pod_runtime())
+    [update] = svc.control_plane.updates
+    assert update.state == DeploymentState.READY and update.ssh_host_keys is None
+
+
+def test_a_resumed_pod_that_cannot_be_asked_keeps_its_known_keys():
+    svc = _agent(("up", None))
+    svc.gpu_allocator = SimpleNamespace(allocate_specific=lambda dep, devices: devices, release=lambda dep: None)
+    svc.pod_backend.resume_pod = lambda rt: rt.model_copy(update={"status": "ready", "current_stage": "ready"})
+    svc.pod_backend.ssh_host_keys = lambda rt: None
+    suspended = _pod_runtime().model_copy(update={
+        "status": "suspended", "metadata": {"gpu_devices": [0], "gpu_count": 1, "ssh_host_keys": [ED]},
+    })
+    svc._resume_runtime(suspended)
+    [update] = svc.control_plane.updates
+    assert update.ssh_host_keys == [ED]
+
+
+def test_a_backend_that_cannot_read_keys_sends_none_so_stored_keys_stay():
+    svc = _agent(("up", None))  # the fake backend has no ssh_host_keys
+    svc._finish_pod_start(_pod_runtime())
+    [update] = svc.control_plane.updates
+    assert update.ssh_host_keys is None
+
+
+def test_a_resumed_pod_reports_its_keys_even_if_it_started_before_keys_were_sent():
+    svc = _agent(("up", None))
+    svc.gpu_allocator = SimpleNamespace(allocate_specific=lambda dep, devices: devices, release=lambda dep: None)
+    svc.pod_backend.resume_pod = lambda rt: rt.model_copy(update={"status": "ready", "current_stage": "ready"})
+    svc.pod_backend.ssh_host_keys = lambda rt: [ED]
+    suspended = _pod_runtime().model_copy(update={
+        "status": "suspended", "endpoint": "ssh://root@1.2.3.4:30123",
+        "metadata": {"gpu_devices": [0], "gpu_count": 1},  # no ssh_host_keys: started before
+    })
+    svc._resume_runtime(suspended)
+    [update] = svc.control_plane.updates
+    assert update.state == DeploymentState.READY and update.ssh_host_keys == [ED]
