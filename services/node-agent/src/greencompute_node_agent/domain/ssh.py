@@ -81,9 +81,15 @@ def pod_start_env(
         else:
             # A workload from before these names were reserved may set it itself.
             env.setdefault("GC_DEPLOYMENT_NAME", deployment_id[:8])
+    # Only metadata.restart_policy decides, never a value left in env.
+    env.pop("GC_RESTART_POLICY", None)
     command = meta.get("command")
     if isinstance(command, str) and command.strip():
         env["GC_START_COMMAND_B64"] = base64.b64encode(command.encode()).decode()
+        # Run it again when it exits (the gateway validated the value).
+        policy = meta.get("restart_policy")
+        if policy in ("on-failure", "always"):
+            env["GC_RESTART_POLICY"] = policy
     return env
 
 

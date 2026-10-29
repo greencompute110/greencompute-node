@@ -234,7 +234,7 @@ class ProcessPodBackend(PodBackend):
         # Mount the SSH bootstrap entrypoint and override the container entrypoint.
         # This injects sshd into any image (Vast.ai / RunPod style).
         # The entrypoint installs openssh-server, writes keys as root, starts
-        # sshd on port 22, then execs the original CMD or `sleep infinity`.
+        # sshd on port 22, then execs the original CMD, or idles as PID 1 if there is none.
         #
         # When we run inside Docker (docker-compose), the path we pass to
         # `docker run -v` is resolved by the host daemon, not our container.
@@ -412,8 +412,7 @@ class ProcessPodBackend(PodBackend):
     def _container_problem(container_id: str) -> str | None:
         """The container itself is gone or keeps exiting, or None if it is up.
         The entrypoint only exits if something kills it (an OOM, say): our
-        `--entrypoint` clears the image's CMD, so a pod otherwise idles in
-        `sleep infinity`."""
+        `--entrypoint` clears the image's CMD, so a pod otherwise just idles."""
         try:
             state = subprocess.run(  # noqa: S603
                 ["docker", "inspect", "-f",  # noqa: S607
