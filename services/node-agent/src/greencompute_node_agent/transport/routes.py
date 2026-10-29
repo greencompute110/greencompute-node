@@ -169,6 +169,26 @@ def inference_healthz(
     return {"status": "ok", "deployment_id": deployment_id}
 
 
+@router.get("/pods/{deployment_id}/logs")
+def pod_logs(
+    deployment_id: str,
+    lines: int = 200,
+    x_agent_auth: str | None = Header(default=None, alias="X-Agent-Auth"),
+) -> dict:
+    """The pod's recent output: its start command's log and its container
+    log, the last `lines` lines of each (at most 2000). A job's output can
+    hold secrets, so only with the node secret (sensitive)."""
+    validate_auth(x_agent_auth, _cfg(), sensitive=True)
+    runtime = _svc().repository.get_runtime(deployment_id)
+    if runtime is None or not runtime.container_id:
+        raise HTTPException(status_code=404, detail="runtime not found")
+    from greencompute_node_agent.domain.pod_logs import collect_pod_logs
+
+    env = runtime.metadata.get("env_vars") or {}
+    return collect_pod_logs(runtime.container_id, lines=lines,
+                            has_command=isinstance(env, dict) and bool(env.get("GC_START_COMMAND_B64")))
+
+
 @router.get("/pods/{deployment_id}/stats")
 def pod_stats(
     deployment_id: str,
