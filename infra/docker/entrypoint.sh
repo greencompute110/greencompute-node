@@ -126,7 +126,7 @@ persist_image_env() {
     local etcenv="${GC_ETC_ENV_FILE:-/etc/environment}"
     local etcnew="${etcenv}.greencompute.$$"
     local names=" "
-    local skip='^(HOSTNAME|HOME|PWD|OLDPWD|SHLVL|TERM|_|SHELL|USER|LOGNAME|MAIL|AUTHORIZED_KEYS|GC_START_COMMAND_B64|GC_NEW_HOST_KEYS)$'
+    local skip='^(HOSTNAME|HOME|PWD|OLDPWD|SHLVL|TERM|_|SHELL|USER|LOGNAME|MAIL|AUTHORIZED_KEYS|GC_START_COMMAND_B64|GC_NEW_HOST_KEYS|GC_RESTART_POLICY)$'
     mkdir -p "$(dirname "$profile")" "$(dirname "$sshenv")"
     : > "$profile"
     : > "$sshenv"
@@ -167,11 +167,90 @@ persist_image_env() {
 
 # --- Start command from the workload (metadata.command) ---
 # Runs in the background once SSH is up, from /workspace, with its output
-# appended to /workspace/greencompute-command.log. The pod stays up when the
-# command finishes, so you can still SSH in and read the log; the rental
-# stops on DELETE or when max_runtime_minutes is reached. The command arrives
-# base64-encoded so quotes and newlines survive the trip through docker -e.
-# Paths are overridable (GC_COMMAND_*) for tests.
+# appended to /workspace/greencompute-command.log; when it exits, a line with
+# its exit code follows. The pod stays up when the command finishes, so you
+# can still SSH in and read the log; the rental stops on DELETE or when
+# max_runtime_minutes is reached. The command arrives base64-encoded so quotes
+# and newlines survive the trip through docker -e.
+#
+# With metadata.restart_policy (GC_RESTART_POLICY) "on-failure" it runs again
+# when it exits with an error, "always" whenever it exits (external API user,
+# request #7: a crashed miner stayed down until their own watchdog noticed).
+# - A run has ended once the command and everything it started in its process
+#   group have exited, so a launcher that starts the job with `&` and returns
+#   is restarted only after the job itself ends, and never killed by us: two
+#   copies never run side by side. (Jobs moved out of the group, by screen,
+#   tmux or setsid, can't be tracked; the docs say to run in the foreground.)
+# - The wait doubles from 5 s up to 5 minutes while runs keep ending within a
+#   minute, and is 5 s again after a longer run.
+# - While /workspace/greencompute-command.pause exists the command is not
+#   started or restarted (also after a resume); deleting the file starts it.
+# - The log is cut to its last part, kept in .log.1, once it passes 50 MB,
+#   checked every minute (copy, then truncate: the command keeps appending).
+# Paths and the first wait are overridable (GC_COMMAND_*,
+# GC_RESTART_DELAY_SECONDS, GC_LOG_*) for tests.
+keep_log_small() {
+    local logfile="$1"
+    local limit="${GC_LOG_LIMIT_BYTES:-52428800}" every="${GC_LOG_CHECK_SECONDS:-60}"
+    local size
+    while sleep "$every"; do
+        size=$(stat -c %s "$logfile" 2>/dev/null || echo 0)
+        if [ "$size" -gt "$limit" ] 2>/dev/null; then
+            cp -f "$logfile" "$logfile.1" && : > "$logfile"
+        fi
+    done
+}
+
+supervise_start_command() {
+    local policy="$1" shell="$2" script="$3" logfile="$4"
+    set +e      # the command failing must not end this loop
+    set -m      # each run gets its own process group (its pid)
+    trap '' HUP # ignored, as under nohup; the command inherits that
+    local pause="${logfile%.log}.pause"
+    local first="${GC_RESTART_DELAY_SECONDS:-5}"
+    { [ "$first" -ge 1 ] && [ "$first" -le 300 ]; } 2>/dev/null || first=5
+    local delay="$first" runs=0 started ran code pid keeper
+    keep_log_small "$logfile" </dev/null >/dev/null 2>&1 &
+    keeper=$!
+    while true; do
+        if [ -e "$pause" ]; then
+            echo "[greencompute] not starting the command while $pause exists; delete it to start it" >>"$logfile"
+            while [ -e "$pause" ]; do sleep 5; done
+            delay="$first"
+        fi
+        started=$SECONDS
+        "$shell" "$script" >>"$logfile" 2>&1 &
+        pid=$!
+        # wait also returns when the job is only stopped (SIGSTOP): go on
+        # waiting until it has really exited.
+        while :; do
+            wait "$pid"
+            code=$?
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1  # stopped: wait would return at once again
+        done
+        ran=$((SECONDS - started))
+        runs=$((runs + 1))
+        echo "[greencompute] start command exited with code $code after ${ran}s" >>"$logfile"
+        if [ "$policy" = never ] || { [ "$policy" = on-failure ] && [ "$code" -eq 0 ]; }; then
+            kill "$keeper" 2>/dev/null
+            return 0
+        fi
+        if kill -0 -- "-$pid" 2>/dev/null; then
+            echo "[greencompute] waiting for the processes it started to end before restarting it" >>"$logfile"
+            while kill -0 -- "-$pid" 2>/dev/null; do sleep 5; done
+            ran=$((SECONDS - started))
+        fi
+        [ "$ran" -ge 60 ] && delay="$first"
+        if [ ! -e "$pause" ]; then
+            echo "[greencompute] restarting it in ${delay}s (restart $runs, restart_policy $policy)" >>"$logfile"
+            sleep "$delay"
+            delay=$((delay * 2))
+            [ "$delay" -le 300 ] || delay=300
+        fi
+    done
+}
+
 run_start_command() {
     local encoded="${GC_START_COMMAND_B64:-}"
     [ -n "$encoded" ] || return 0
@@ -185,8 +264,10 @@ run_start_command() {
     mkdir -p "$workdir"
     local shell=bash
     command -v bash >/dev/null 2>&1 || shell=sh
-    echo "[greencompute] running the workload's start command; output in $logfile"
-    ( cd "$workdir" && nohup "$shell" "$script" >>"$logfile" 2>&1 & )
+    local policy="${GC_RESTART_POLICY:-never}"
+    echo "[greencompute] running the workload's start command (restart_policy $policy); output in $logfile"
+    ( cd "$workdir" && supervise_start_command "$policy" "$shell" "$script" "$logfile" ) </dev/null >/dev/null 2>&1 &
+    return 0
 }
 
 echo "[greencompute] setting up SSH..."
@@ -206,5 +287,23 @@ if [ $# -gt 0 ]; then
     exec "$@"
 else
     echo "[greencompute] no CMD specified — keeping container alive"
-    exec sleep infinity
+    # Stay as PID 1 rather than exec'ing `sleep infinity`: bash reaps the
+    # processes left behind when a start command's run ends (sleep never
+    # would, so they'd pile up as zombies). On `docker stop` (a suspend) every
+    # process gets SIGTERM and up to 8 s to finish, within docker's 10 s,
+    # where before they were killed outright.
+    set +e
+    stop_all() {
+        kill -TERM -1 2>/dev/null
+        for _ in 1 2 3 4 5 6 7 8; do
+            kill -0 -1 2>/dev/null || break
+            sleep 1
+        done
+        exit 0
+    }
+    trap stop_all TERM INT
+    while :; do
+        sleep 3600 &
+        wait $!
+    done
 fi
