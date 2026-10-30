@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import http.client
+import json
 import logging
 import threading
+from urllib.error import URLError
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -46,6 +49,55 @@ from greencompute_node_agent.infrastructure.repository import NodeAgentRepositor
 logger = logging.getLogger(__name__)
 
 
+class ControlPlaneUnavailable(ControlPlaneHTTPError):
+    """The control plane couldn't be reached or gave an answer that doesn't
+    parse: no connection, a timeout, a reply cut short or not JSON, a
+    payload this node's protocol can't read. Raised only by the node's
+    control-plane client (so a timeout elsewhere on the node, a registry
+    pull or docker, is never mistaken for it). A 503 ControlPlaneHTTPError,
+    so every existing "keep going" handler for those catches it too."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(503, detail)
+
+
+class _NodeControlPlaneClient(ControlPlaneHTTPClient):
+    """The protocol client, with transport failures and unreadable answers
+    as ControlPlaneUnavailable (an HTTP error status stays ControlPlaneHTTPError)."""
+
+    def _request(self, method: str, path: str, body: bytes | None = None) -> Any:
+        try:
+            return super()._request(method, path, body)
+        except ControlPlaneHTTPError:
+            raise
+        except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:  # URLError, timeouts, SSL…
+            raise ControlPlaneUnavailable(f"{method} {path}: {exc}") from exc
+
+    def _parsed(self, call, *args):
+        try:
+            return call(*args)
+        except ControlPlaneHTTPError:
+            raise
+        except ValueError as exc:  # pydantic ValidationError: protocol skew, not a verdict on the deployment
+            raise ControlPlaneUnavailable(f"unreadable answer: {exc}") from exc
+
+    def list_leases(self, hotkey: str):
+        return self._parsed(super().list_leases, hotkey)
+
+    def get_workload(self, workload_id: str):
+        return self._parsed(super().get_workload, workload_id)
+
+    def get_deployment(self, deployment_id: str):
+        return self._parsed(super().get_deployment, deployment_id)
+
+
+def _control_plane_unavailable(exc: BaseException) -> bool:
+    """Whether `exc` means the control plane couldn't answer for now (not
+    reachable, or a 5xx or 429). Such an error says nothing about the
+    deployment and must never become a verdict on it (FAILED, orphaned)."""
+    return isinstance(exc, ControlPlaneHTTPError) and (exc.status >= 500 or exc.status == 429)
+
+
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -56,7 +108,7 @@ class NodeAgentService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.repository = NodeAgentRepository(state_path=settings.runtime_state_path)
-        self.control_plane = ControlPlaneHTTPClient(
+        self.control_plane = _NodeControlPlaneClient(
             base_url=settings.control_plane_url,
             hotkey=settings.miner_hotkey,
             auth_secret=settings.miner_auth_secret,
@@ -233,8 +285,8 @@ class NodeAgentService:
         on 2026-10-30 removed both catalog models)."""
         try:
             return self.control_plane.list_leases(hotkey)
-        except ControlPlaneHTTPError:
-            logger.exception("failed to sync leases for %s", hotkey)
+        except Exception as exc:  # noqa: BLE001 - HTTP, transport or a malformed answer: no list
+            logger.warning("failed to sync leases for %s: %s", hotkey, exc)
             return None
 
     def reconcile_once(self, hotkey: str) -> None:
@@ -285,6 +337,7 @@ class NodeAgentService:
         # duplicate we ran for another box — its lease is alive on that box"
         # (tear down locally, but DON'T report or we'd kill the real pod).
         fleet_deployment_ids = {lease.deployment_id for lease in all_leases}
+        self._resend_pending_reports(leases, fleet_deployment_ids)
 
         # Pods whose container is up but whose SSH server isn't confirmed yet:
         # one look each per tick, never a blocking wait, which stalled every
@@ -351,17 +404,31 @@ class NodeAgentService:
                     continue  # Already completed (ready/failed/terminated)
             try:
                 self._reconcile_workload(lease)
-            except Exception:
+            except Exception as exc:
+                if _control_plane_unavailable(exc):
+                    # The control plane failed to answer, not the deployment:
+                    # FAILED is final there, so never report it for this.
+                    # The next tick tries again.
+                    logger.warning("lease %s: control plane unavailable (%s); retrying next tick",
+                                   lease.deployment_id, exc)
+                    continue
                 logger.exception("failed to reconcile lease %s", lease.deployment_id)
                 # Report failure to control plane so deployment doesn't stay SCHEDULED forever
-                try:
-                    self.control_plane.update_deployment_status(DeploymentStatusUpdate(
-                        deployment_id=lease.deployment_id,
-                        state=DeploymentState.FAILED,
-                        error="node-agent reconciliation failed (check node-agent logs)",
-                    ))
-                except Exception:
-                    logger.exception("failed to report reconciliation failure for %s", lease.deployment_id)
+                failed = DeploymentStatusUpdate(
+                    deployment_id=lease.deployment_id,
+                    state=DeploymentState.FAILED,
+                    error="node-agent reconciliation failed (check node-agent logs)",
+                )
+                runtime = self.repository.get_runtime(lease.deployment_id)
+                if runtime is not None:
+                    runtime = runtime.model_copy(update={"status": "failed", "updated_at": _utcnow()})
+                    self.repository.upsert_runtime(runtime)
+                    self._send_status(runtime, failed)
+                else:
+                    try:
+                        self.control_plane.update_deployment_status(failed)
+                    except Exception:
+                        logger.exception("failed to report reconciliation failure for %s", lease.deployment_id)
 
         # Clean up runtimes that are no longer ours to run.
         for deployment_id, runtime in self.repository.snapshot_runtime_items():
@@ -372,28 +439,13 @@ class NodeAgentService:
             if runtime.status == "suspended":
                 # Pod-safe SUSPEND (ORCH-H3): a suspended runtime is an
                 # INTENTIONALLY stopped-but-preserved container. Lease ABSENCE
-                # alone must NEVER destroy it — a transient list_leases gap would
-                # otherwise wipe preserved work. So before reaping, confirm with
-                # the control-plane: tear it down ONLY if the deployment is
-                # EXPLICITLY TERMINATED (the credit-exhaustion reaper deleting a
-                # saved/unsaved pod, or an operator cleanup). A still-SUSPENDED
-                # deployment — or an unreachable control-plane — keeps the
-                # container on disk for a later `docker start` resume.
-                terminated = False
-                try:
-                    dep = self.control_plane.get_deployment(deployment_id)
-                    terminated = dep is not None and dep.state == DeploymentState.TERMINATED
-                except Exception:
-                    logger.warning(
-                        "could not confirm deployment state for suspended runtime %s — keeping it",
-                        deployment_id,
-                    )
-                if terminated:
-                    logger.info(
-                        "reaping suspended runtime %s — control-plane terminated the deployment",
-                        deployment_id,
-                    )
-                    self._terminate_runtime(runtime, reason="lease_terminated")
+                # alone must NEVER destroy it: it goes only once the control
+                # plane says the deployment ended (the credit-exhaustion
+                # reaper, an operator, a delete). An unreachable control plane
+                # keeps it on disk for a later `docker start` resume.
+                if self._deployment_gone(runtime):
+                    logger.info("reaping suspended runtime %s — the deployment has ended", deployment_id)
+                    self._terminate_runtime(runtime, reason="lease_terminated", report=False)
                     self.repository.remove_runtime(deployment_id)
                 continue
             if deployment_id in fleet_deployment_ids:
@@ -410,9 +462,50 @@ class NodeAgentService:
                 )
                 self._terminate_runtime(runtime, reason="foreign_node_duplicate", report=False)
             else:
-                # Lease is gone fleet-wide → genuine orphan. Terminate + report.
+                # The lease is missing fleet-wide. Like a suspended runtime,
+                # a running one is destroyed only once the control plane says
+                # the deployment ended or isn't this machine's any more: a
+                # lease list that is empty or partial for any other reason must
+                # never wipe customers' pods (a pod the control plane still
+                # runs, and bills, stays). Nothing is reported: the control
+                # plane already knows, and a TERMINATED could race a new
+                # placement of the same deployment.
+                if not self._deployment_gone(runtime):
+                    continue
                 logger.info("terminating orphaned runtime %s (status=%s)", deployment_id, runtime.status)
-                self._terminate_runtime(runtime, reason="lease_expired")
+                self._terminate_runtime(runtime, reason="lease_expired", report=False)
+
+    #: How often a runtime without a lease is checked with the control plane.
+    _GONE_CHECK_EVERY = timedelta(seconds=60)
+
+    def _deployment_gone(self, runtime: UnifiedRuntimeRecord, *, now: datetime | None = None) -> bool:
+        """True when the control plane says the runtime's deployment has ended
+        (terminated, failed) or isn't this machine's (deleted, or moved).
+        False when it is live there, or couldn't be asked: then the runtime is
+        kept, and asked about again after _GONE_CHECK_EVERY, not every tick."""
+        now = now or _utcnow()
+        checked = runtime.metadata.get("gone_checked_at")
+        if checked:
+            try:
+                if now - datetime.fromisoformat(checked) < self._GONE_CHECK_EVERY:
+                    return False
+            except ValueError:
+                pass
+        try:
+            dep = self.control_plane.get_deployment(runtime.deployment_id)
+        except Exception as exc:  # noqa: BLE001 - couldn't ask: keep it
+            logger.warning("could not confirm deployment %s with the control plane (%s) — keeping its runtime",
+                           runtime.deployment_id, exc)
+            dep, gone = None, False
+        else:
+            gone = dep is None or dep.state in (DeploymentState.TERMINATED, DeploymentState.FAILED)
+        if not gone:
+            if dep is not None:
+                logger.warning("runtime %s has no lease but the control plane has it %s — keeping it",
+                               runtime.deployment_id, dep.state.value)
+            self.repository.upsert_runtime(runtime.model_copy(update={
+                "metadata": {**runtime.metadata, "gone_checked_at": now.isoformat()}}))
+        return gone
 
     def _reconcile_workload(self, lease: LeaseAssignment) -> None:
         """Dispatch a new lease to the appropriate runtime handler based on workload kind."""
@@ -955,19 +1048,97 @@ class NodeAgentService:
         except Exception:
             logger.warning("could not report %s for %s", state.value, runtime.deployment_id, exc_info=True)
 
-    def _report_deployment_ready(self, runtime: UnifiedRuntimeRecord) -> None:
+    _RESEND_EVERY = timedelta(seconds=30)
+    _REPORT_FITS_STATUS = {"ready": "ready", "failed": "failed", "suspended": "suspended", "terminated": "terminated"}
+
+    def _resend_pending_reports(self, my_leases: list[LeaseAssignment], fleet_ids: set[str], *,
+                                now: datetime | None = None) -> None:
+        """Send again the status reports that didn't land (the control plane
+        was down or busy), at most every _RESEND_EVERY each, and only while
+        they still fit: the runtime is still in that state, and the lease
+        says the same (a READY or FAILED only while this machine holds the
+        lease; a SUSPENDED only while the lease is suspended; a TERMINATED
+        unless the deployment now runs on another machine). A report that no
+        longer fits is dropped, so an old one never undoes a resume, a
+        re-placement or a termination the control plane has decided since."""
+        now = now or _utcnow()
+        mine = {lease.deployment_id: (getattr(lease, "status", None) or "").lower() for lease in my_leases}
+        for dep_id, runtime in self.repository.snapshot_runtime_items():
+            pending = runtime.metadata.get("pending_report")
+            if not pending:
+                continue
+            try:
+                update = DeploymentStatusUpdate.model_validate(pending)
+            except ValueError:
+                self._mark_pending(runtime, None)
+                continue
+            state = update.state.value
+            lease = mine.get(dep_id)
+            fits = self._REPORT_FITS_STATUS.get(state) == runtime.status and {
+                "ready": lease is not None and lease != "suspended",
+                "failed": lease is not None and lease != "suspended",
+                "suspended": lease == "suspended",
+                "terminated": lease is not None or dep_id not in fleet_ids,
+            }.get(state, False)
+            if not fits:
+                logger.info("dropping the undelivered %s report for %s: things have moved on", state, dep_id)
+                self._mark_pending(runtime, None)
+                continue
+            tried = runtime.metadata.get("pending_tried_at")
+            if tried:
+                try:
+                    if now - datetime.fromisoformat(tried) < self._RESEND_EVERY:
+                        continue
+                except ValueError:
+                    pass
+            runtime = runtime.model_copy(update={"metadata": {**runtime.metadata, "pending_tried_at": now.isoformat()}})
+            self.repository.upsert_runtime(runtime)
+            self._send_status(runtime, update)
+
+    def _mark_pending(self, runtime: UnifiedRuntimeRecord, update: DeploymentStatusUpdate | None) -> UnifiedRuntimeRecord:
+        """Keep `update` on the runtime to send again (None: nothing waiting).
+        Callers pass the runtime they have just saved."""
+        want = update.model_dump(mode="json") if update is not None else None
+        if runtime.metadata.get("pending_report") == want:
+            return runtime
+        meta = {k: v for k, v in runtime.metadata.items() if k not in ("pending_report", "pending_tried_at")}
+        if want is not None:
+            meta["pending_report"] = want
+        runtime = runtime.model_copy(update={"metadata": meta})
+        self.repository.upsert_runtime(runtime)
+        return runtime
+
+    def _send_status(self, runtime: UnifiedRuntimeRecord, update: DeploymentStatusUpdate) -> bool:
+        """Send a status report about `runtime`. If the control plane can't
+        take it now, it waits on the runtime and goes again at the start of
+        each reconcile pass until it lands; one the control plane refuses
+        (4xx) is logged and dropped, never retried forever. True if it landed."""
         try:
-            self.control_plane.update_deployment_status(DeploymentStatusUpdate(
-                deployment_id=runtime.deployment_id,
-                state=DeploymentState.READY,
-                endpoint=runtime.endpoint,
-                ssh_private_key=runtime.metadata.get("ssh_private_key"),
-                port_mappings=runtime.port_mappings or None,
-                ssh_host_keys=runtime.metadata.get("ssh_host_keys"),
-                ready_instances=1,
-            ))
-        except ControlPlaneHTTPError:
-            logger.exception("failed to report ready for %s", runtime.deployment_id)
+            self.control_plane.update_deployment_status(update)
+        except Exception as exc:  # noqa: BLE001 - a report must never take the reconcile down
+            if _control_plane_unavailable(exc):
+                logger.warning("%s report for %s didn't land (%s); sending it again next tick",
+                               update.state.value, runtime.deployment_id, exc)
+                self._mark_pending(runtime, update)
+            else:
+                logger.exception("control plane refused the %s report for %s", update.state.value, runtime.deployment_id)
+                self._mark_pending(runtime, None)
+            return False
+        self._mark_pending(runtime, None)
+        return True
+
+    def _report_deployment_ready(self, runtime: UnifiedRuntimeRecord) -> None:
+        """Tell the control plane the runtime is ready (resent until it lands,
+        so a busy control plane never leaves it `starting` or fails it)."""
+        self._send_status(runtime, DeploymentStatusUpdate(
+            deployment_id=runtime.deployment_id,
+            state=DeploymentState.READY,
+            endpoint=runtime.endpoint,
+            ssh_private_key=runtime.metadata.get("ssh_private_key"),
+            port_mappings=runtime.port_mappings or None,
+            ssh_host_keys=runtime.metadata.get("ssh_host_keys"),
+            ready_instances=1,
+        ))
 
     def _fail_runtime(
         self, runtime: UnifiedRuntimeRecord, error: str, *, failure_class: str = "workload_dispatch",
@@ -982,14 +1153,11 @@ class NodeAgentService:
             "updated_at": _utcnow(),
         })
         self.repository.upsert_runtime(runtime)
-        try:
-            self.control_plane.update_deployment_status(DeploymentStatusUpdate(
-                deployment_id=runtime.deployment_id,
-                state=DeploymentState.FAILED,
-                error=error,
-            ))
-        except ControlPlaneHTTPError:
-            logger.exception("failed to report failure for %s", runtime.deployment_id)
+        self._send_status(runtime, DeploymentStatusUpdate(
+            deployment_id=runtime.deployment_id,
+            state=DeploymentState.FAILED,
+            error=error,
+        ))
 
     def _terminate_runtime(self, runtime: UnifiedRuntimeRecord, reason: str = "terminated", *, report: bool = True) -> None:
         """Tear down a runtime locally. When `report` is False we DON'T tell the
@@ -1026,13 +1194,12 @@ class NodeAgentService:
         })
         self.repository.upsert_runtime(runtime)
         if report:
-            try:
-                self.control_plane.update_deployment_status(DeploymentStatusUpdate(
-                    deployment_id=runtime.deployment_id,
-                    state=DeploymentState.TERMINATED,
-                ))
-            except ControlPlaneHTTPError:
-                logger.exception("failed to report termination for %s", runtime.deployment_id)
+            self._send_status(runtime, DeploymentStatusUpdate(
+                deployment_id=runtime.deployment_id,
+                state=DeploymentState.TERMINATED,
+            ))
+        else:
+            self._mark_pending(runtime, None)  # nothing about it is to be sent any more
 
     def _suspend_runtime(self, runtime: UnifiedRuntimeRecord) -> None:
         """Pod-safe SUSPEND (ORCH-H3). Stop the runtime in place and free GPUs,
@@ -1097,13 +1264,10 @@ class NodeAgentService:
             })
 
         self.repository.upsert_runtime(runtime)
-        try:
-            self.control_plane.update_deployment_status(DeploymentStatusUpdate(
-                deployment_id=runtime.deployment_id,
-                state=DeploymentState.SUSPENDED,
-            ))
-        except ControlPlaneHTTPError:
-            logger.exception("failed to report SUSPENDED for %s", runtime.deployment_id)
+        self._send_status(runtime, DeploymentStatusUpdate(
+            deployment_id=runtime.deployment_id,
+            state=DeploymentState.SUSPENDED,
+        ))
 
     def _resume_runtime(self, runtime: UnifiedRuntimeRecord) -> None:
         """Pod-safe RESUME (ORCH-H3). Bring a suspended runtime back online:
