@@ -1,4 +1,4 @@
-"""Live pod stats — wraps `docker stats`, `nvidia-smi`, and `docker exec df`.
+"""Live pod stats — wraps `docker stats`, `nvidia-smi` (per GPU), and `docker exec df`.
 
 Called by the /pods/{deployment_id}/stats endpoint. Best-effort: any probe
 that fails is silently omitted from the result so the UI can render partial
@@ -11,9 +11,14 @@ import json
 import logging
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+#: Shared by every stats request (three probes each), not a pool per request.
+_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="pod-stats")
+PROBE_TIMEOUT = 4.0
 
 
 def collect_pod_stats(
@@ -21,10 +26,17 @@ def collect_pod_stats(
     gpu_device_ids: list[int] | None = None,
     workspace_path: str = "/workspace",
 ) -> dict[str, Any]:
-    out: dict[str, Any] = {}
+    """The three probes run side by side: the slowest one, not their sum
+    (docker stats alone takes about 2 s), bounds a reading, and each gives
+    up after 4 s, inside the gateway's 6 s wait."""
+    docker_f = _POOL.submit(_docker_stats, container_id)
+    gpus_f = _POOL.submit(gpu_details, gpu_device_ids)
+    disk_f = _POOL.submit(_disk_usage, container_id, workspace_path)
+    cpu_pct, mem_used, mem_limit, net_rx, net_tx = docker_f.result()
+    gpus = gpus_f.result()
+    disk_used, disk_total = disk_f.result()
 
-    # 1. docker stats — CPU %, mem, network
-    cpu_pct, mem_used, mem_limit, net_rx, net_tx = _docker_stats(container_id)
+    out: dict[str, Any] = {}
     if cpu_pct is not None:
         out["cpu_pct"] = cpu_pct
     if mem_used is not None:
@@ -36,23 +48,94 @@ def collect_pod_stats(
     if net_tx is not None:
         out["net_tx_bytes"] = net_tx
 
-    # 2. GPU util + VRAM
-    gpu_util, vram_used, vram_total = _nvidia_smi(gpu_device_ids)
-    if gpu_util is not None:
-        out["gpu_util_pct"] = gpu_util
-    if vram_used is not None:
-        out["vram_used_mb"] = vram_used
-    if vram_total is not None:
-        out["vram_total_mb"] = vram_total
+    # Each GPU (use, memory, temperature, power, clocks, fan), and the totals
+    # the dashboard shows. VRAM totals only over GPUs that report both, so
+    # used / total is never over 100%.
+    if gpus:
+        out["gpus"] = gpus
+        utils = [g["util_pct"] for g in gpus if g.get("util_pct") is not None]
+        both = [g for g in gpus if g.get("memory_used_mb") is not None and g.get("memory_total_mb") is not None]
+        if utils:
+            out["gpu_util_pct"] = sum(utils) / len(utils)
+        if both:
+            out["vram_used_mb"] = sum(g["memory_used_mb"] for g in both)
+            out["vram_total_mb"] = sum(g["memory_total_mb"] for g in both)
 
-    # 3. Disk — df inside the container
-    disk_used, disk_total = _disk_usage(container_id, workspace_path)
     if disk_used is not None:
         out["disk_used_gb"] = disk_used
     if disk_total is not None:
         out["disk_total_gb"] = disk_total
-
     return out
+
+
+#: nvidia-smi --query-gpu fields, and the names the API gives them.
+_GPU_QUERY = (
+    ("index", None),
+    ("uuid", "uuid"),
+    ("name", "name"),
+    ("utilization.gpu", "util_pct"),
+    ("memory.used", "memory_used_mb"),
+    ("memory.total", "memory_total_mb"),
+    ("temperature.gpu", "temperature_c"),
+    ("power.draw", "power_w"),
+    ("power.limit", "power_limit_w"),
+    ("clocks.sm", "sm_clock_mhz"),
+    ("clocks.mem", "mem_clock_mhz"),
+    ("fan.speed", "fan_pct"),
+)
+_TEXT_FIELDS = {"uuid", "name"}
+
+
+def _number(value: str) -> float | None:
+    """A reading, or None for "[N/A]", "[Not Supported]" and the like."""
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def gpu_details(device_ids: list[int] | None) -> list[dict[str, Any]]:
+    """One entry per GPU of the pod, numbered as the pod sees them (0, 1, …
+    in the order of the machine's numbering), with the UUID `nvidia-smi -L`
+    shows inside the pod. Readings the card doesn't report are null. One
+    nvidia-smi call on the machine, which the renter can't influence."""
+    if not device_ids:
+        return []
+    cmd = [
+        "nvidia-smi",
+        f"--id={','.join(str(d) for d in sorted(device_ids))}",
+        "--query-gpu=" + ",".join(field for field, _ in _GPU_QUERY),
+        "--format=csv,noheader,nounits",
+    ]
+    order = {d: i for i, d in enumerate(sorted(device_ids))}
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=PROBE_TIMEOUT)  # noqa: S603
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    # A card that has failed makes nvidia-smi exit with an error but still
+    # print the others: keep those, and name the one that didn't answer.
+    gpus: list[dict[str, Any]] = []
+    for line in r.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != len(_GPU_QUERY):
+            continue
+        try:
+            host_index = int(parts[0])
+        except ValueError:
+            continue
+        if host_index not in order:
+            continue  # not one of the pod's GPUs
+        gpu: dict[str, Any] = {"index": order[host_index]}
+        for (field, key), value in zip(_GPU_QUERY[1:], parts[1:]):
+            gpu[key] = value if field in _TEXT_FIELDS else _number(value)
+        gpus.append(gpu)
+    if not gpus and r.returncode != 0:
+        return []  # nvidia-smi itself isn't working: nothing to say per card
+    answered = {g["index"] for g in gpus}
+    for host_index, pod_index in order.items():
+        if pod_index not in answered:
+            gpus.append({"index": pod_index, "error": "this GPU didn't answer nvidia-smi"})
+    return sorted(gpus, key=lambda g: g["index"])
 
 
 def _docker_stats(container_id: str) -> tuple[float | None, float | None, float | None, float | None, float | None]:
@@ -66,7 +149,7 @@ def _docker_stats(container_id: str) -> tuple[float | None, float | None, float 
             ],
             capture_output=True,
             text=True,
-            timeout=8.0,
+            timeout=PROBE_TIMEOUT,
         )
         if r.returncode != 0 or not r.stdout.strip():
             return None, None, None, None, None
@@ -79,65 +162,28 @@ def _docker_stats(container_id: str) -> tuple[float | None, float | None, float 
         return None, None, None, None, None
 
 
-def _nvidia_smi(device_ids: list[int] | None) -> tuple[float | None, float | None, float | None]:
-    """Aggregate GPU util + VRAM across the pod's allocated devices."""
-    if not device_ids:
-        return None, None, None
-    cmd = [
-        "nvidia-smi",
-        f"--id={','.join(str(d) for d in device_ids)}",
-        "--query-gpu=utilization.gpu,memory.used,memory.total",
-        "--format=csv,noheader,nounits",
-    ]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5.0)  # noqa: S603
-        if r.returncode != 0 or not r.stdout.strip():
-            return None, None, None
-        utils: list[float] = []
-        used: list[float] = []
-        total: list[float] = []
-        for line in r.stdout.strip().splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 3:
-                try:
-                    utils.append(float(parts[0]))
-                    used.append(float(parts[1]))
-                    total.append(float(parts[2]))
-                except ValueError:
-                    pass
-        if not utils:
-            return None, None, None
-        avg_util = sum(utils) / len(utils)
-        return avg_util, sum(used), sum(total)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None, None, None
-
-
 def _disk_usage(container_id: str, path: str) -> tuple[float | None, float | None]:
-    """Run `df -B1 <path>` inside container. Returns (used_gb, total_gb)."""
+    """`df -B1 <path>` inside the container: (used_gb, total_gb). Its output
+    comes from the renter's image, so it is read with a size cap."""
+    from greencompute_node_agent.domain.pod import bounded_output
+
+    raw = bounded_output(["docker", "exec", container_id, "df", "-B1", path], limit=16384, timeout=PROBE_TIMEOUT)
+    if raw is None:
+        return None, None
+    # Filesystem     1B-blocks       Used Available Use% Mounted on
+    # /dev/loop0   53687091200  ...
+    lines = raw.decode("utf-8", "replace").strip().splitlines()
+    if len(lines) < 2:
+        return None, None
+    fields = lines[-1].split()
+    if len(fields) < 4:
+        return None, None
     try:
-        r = subprocess.run(  # noqa: S603
-            ["docker", "exec", container_id, "df", "-B1", path],  # noqa: S607
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-        )
-        if r.returncode != 0:
-            return None, None
-        # Output format:
-        # Filesystem     1B-blocks       Used Available Use% Mounted on
-        # /dev/loop0  53,687,091,200  ...
-        lines = r.stdout.strip().splitlines()
-        if len(lines) < 2:
-            return None, None
-        fields = lines[-1].split()
-        if len(fields) < 4:
-            return None, None
         total_bytes = float(fields[1])
         used_bytes = float(fields[2])
-        return used_bytes / 1e9, total_bytes / 1e9
-    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+    except ValueError:
         return None, None
+    return used_bytes / 1e9, total_bytes / 1e9
 
 
 # ---------------------------------------------------------------------------

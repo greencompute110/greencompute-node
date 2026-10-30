@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-import select
+import selectors
 import subprocess
 import time
 from collections.abc import Iterator
@@ -26,24 +26,121 @@ def _utcnow() -> datetime:
 
 
 def _last_log_lines(container_id: str, count: int = 5) -> str:
-    try:
-        logs = subprocess.run(  # noqa: S603
-            ["docker", "logs", "--tail", str(count), container_id],  # noqa: S607
-            capture_output=True, text=True, timeout=5.0,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+    got = bounded_tail(["docker", "logs", "--tail", str(count), container_id],  # noqa: S607
+                       keep=4096, read_limit=1024 * 1024, timeout=5.0, merge_stderr=True)
+    if got is None:
         return "(unavailable)"
-    lines = [line.strip() for line in ((logs.stdout or "") + (logs.stderr or "")).splitlines() if line.strip()]
+    if not got[1]:
+        return "(the last lines are too long to show)"
+    from greencompute_node_agent.domain.pod_logs import clean_terminal_text
+
+    text = clean_terminal_text(got[0].decode("utf-8", "replace"))
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
     return " | ".join(lines[-count:]) or "(none)"
 
 
-def bounded_output(cmd: list[str], *, limit: int, timeout: float) -> bytes | None:
-    """stdout of `cmd`, or None if it fails, takes longer than `timeout`, or
-    prints more than `limit` bytes. For commands run inside a renter's
-    container, whose output they control: subprocess.run would hold all of it
-    in this process's memory before any cap could apply."""
+def run_capped(cmd: list[str], *, keep: int, timeout: float) -> tuple[int | None, bytes, bool, bool]:
+    """Run `cmd` (stderr into stdout), keeping only the last `keep` bytes of
+    its output. Returns (exit code or None, kept output, whether earlier
+    output was dropped, whether it timed out). For a command the renter runs
+    in their own pod, so like bounded_tail it never holds more than `keep`
+    and a chunk, whatever it prints."""
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)  # noqa: S603
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)  # noqa: S603
+    except OSError:
+        return None, b"", False, False
+    deadline = time.monotonic() + timeout
+    tail = bytearray()
+    dropped = False
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or not _readable(proc.stdout, left):
+                return None, bytes(tail), dropped, True
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            tail += chunk
+            if len(tail) > keep:
+                del tail[:len(tail) - keep]
+                dropped = True
+        try:
+            code = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            return None, bytes(tail), dropped, True
+        return code, bytes(tail), dropped, False
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
+
+
+def bounded_tail(cmd: list[str], *, keep: int, read_limit: int, timeout: float,
+                 merge_stderr: bool = False) -> tuple[bytes, bool] | None:
+    """The last `keep` bytes `cmd` prints, and whether it finished within
+    `read_limit` bytes (False: we stopped reading, so what we kept isn't its
+    end). None if it can't be run, exits with an error, or takes longer
+    than `timeout`. Holds at most `keep` bytes and one chunk in memory,
+    whatever the command prints."""
+    try:
+        proc = subprocess.Popen(  # noqa: S603
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge_stderr else subprocess.DEVNULL)
+    except OSError:
+        return None
+    deadline = time.monotonic() + timeout
+    tail = bytearray()
+    total = 0
+    complete = True
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            if not _readable(proc.stdout, left):
+                return None
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            tail += chunk
+            if len(tail) > keep:
+                del tail[:len(tail) - keep]
+            if total > read_limit:
+                complete = False
+                break
+        if complete:
+            try:
+                code = proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                return None
+            if code != 0:
+                return None
+        return bytes(tail), complete
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
+
+
+def _readable(stream, timeout: float) -> bool:
+    """Whether `stream` has data (or EOF) within `timeout`. A selector, not
+    select.select, which fails for file descriptors above 1024."""
+    with selectors.DefaultSelector() as sel:
+        sel.register(stream, selectors.EVENT_READ)
+        return bool(sel.select(timeout))
+
+
+def bounded_output(cmd: list[str], *, limit: int, timeout: float, merge_stderr: bool = False) -> bytes | None:
+    """stdout of `cmd` (and its stderr, with `merge_stderr`), or None if it
+    fails, takes longer than `timeout`, or prints more than `limit` bytes.
+    For output a renter controls (anything run inside their container, or
+    their container's log): subprocess.run would hold all of it in this
+    process's memory before any cap could apply."""
+    try:
+        proc = subprocess.Popen(  # noqa: S603
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge_stderr else subprocess.DEVNULL)
     except OSError:
         return None
     deadline = time.monotonic() + timeout
@@ -53,8 +150,7 @@ def bounded_output(cmd: list[str], *, limit: int, timeout: float) -> bytes | Non
             left = deadline - time.monotonic()
             if left <= 0:
                 return None
-            ready, _, _ = select.select([proc.stdout], [], [], left)
-            if not ready:
+            if not _readable(proc.stdout, left):
                 return None
             chunk = os.read(proc.stdout.fileno(), 65536)
             if not chunk:

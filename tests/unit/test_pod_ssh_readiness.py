@@ -131,6 +131,8 @@ def test_a_container_that_keeps_exiting_fails_even_while_sshd_is_momentarily_up(
     monkeypatch.setattr(subprocess, "run", _docker(
         top="root 50 1 0 10:00 ? 00:00:00 /usr/sbin/sshd\n", restarts="3", exit_code="137",
         logs="killed\n"))
+    # The last lines come through the size-capped reader (renter-controlled output).
+    monkeypatch.setattr(pod_module, "bounded_tail", lambda cmd, **kw: (b"killed\n", True))
     status, reason = ProcessPodBackend().ssh_status(_rt())
     assert status == "failed"
     assert "exits right after it starts (exit code 137, restarted 3 time(s))" in reason
