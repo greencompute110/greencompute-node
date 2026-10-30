@@ -224,12 +224,18 @@ class NodeAgentService:
 
     # --- Lease sync & reconciliation ---
 
-    def sync_leases(self, hotkey: str) -> list[LeaseAssignment]:
+    def sync_leases(self, hotkey: str) -> list[LeaseAssignment] | None:
+        """This node's leases, or None when the control plane didn't give a
+        list. None is never "no leases": an error used to come back as [],
+        and the orphan clean-up then removed every pod and model on the box
+        as if its lease had ended (a control-plane 500 while .88 went down on
+        2026-10-29 removed a customer's running pod; another during a deploy
+        on 2026-10-30 removed both catalog models)."""
         try:
             return self.control_plane.list_leases(hotkey)
         except ControlPlaneHTTPError:
             logger.exception("failed to sync leases for %s", hotkey)
-            return []
+            return None
 
     def reconcile_once(self, hotkey: str) -> None:
         """Serialize the reconcile flow against the worker loop and the manual
@@ -247,6 +253,11 @@ class NodeAgentService:
     def _reconcile_once_locked(self, hotkey: str) -> None:
         """Main reconciliation loop: sync leases, dispatch workloads, cleanup orphans."""
         all_leases = self.sync_leases(hotkey)
+        if all_leases is None:
+            # Without a lease list nothing can be judged an orphan: keep
+            # everything as it is and try again next tick.
+            logger.warning("no lease list from the control plane: skipping this reconcile pass")
+            return
         # Multi-box-per-hotkey: the control-plane returns EVERY lease for the
         # hotkey, but each lease is placed on a specific node_id. Without this
         # filter, every box sharing the hotkey would run every deployment —

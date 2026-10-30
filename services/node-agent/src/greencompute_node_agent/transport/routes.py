@@ -89,6 +89,8 @@ def list_leases(
 ) -> list[dict]:
     validate_auth(x_agent_auth, _cfg(), sensitive=True)
     leases = _svc().sync_leases(hotkey)
+    if leases is None:
+        raise HTTPException(status_code=502, detail="the control plane didn't return a lease list")
     return [lease.model_dump(mode="json") for lease in leases]
 
 
