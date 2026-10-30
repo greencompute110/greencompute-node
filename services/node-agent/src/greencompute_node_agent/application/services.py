@@ -262,6 +262,9 @@ class NodeAgentService:
         node = NodeCapability(
             hotkey=s.miner_hotkey,
             node_id=s.node_id,
+            # This box's own agent API: boxes share a hotkey, so the gateway
+            # finds stats, logs and commands here by node, not by hotkey.
+            api_base_url=s.miner_api_base_url,
             gpu_model=s.gpu_model,
             gpu_count=s.gpu_count,
             available_gpus=available_gpus,
