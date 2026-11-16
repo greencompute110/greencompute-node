@@ -87,9 +87,11 @@ services:
       GREENCOMPUTE_ARTIFACT_CACHE_DIR: /tmp/greencompute-node-artifacts
       # PYTHONPATH
       PYTHONPATH: /app/protocol/src:/app/node/services/node-agent/src
+    # websockets: uvicorn needs it to serve the pods' browser terminal
+    # (/pods/<id>/terminal); without it the gateway's terminal can't connect.
     command: >
       sh -lc "apt-get update -qq && apt-get install -y -qq docker.io openssh-client >/dev/null 2>&1;
-      pip install -q fastapi uvicorn pydantic substrate-interface &&
+      pip install -q fastapi uvicorn websockets pydantic substrate-interface &&
       uvicorn greencompute_node_agent.main:app --host 0.0.0.0 --port 8007"
     # User-pod SSH (30000-31000) and custom-port (31001-32000) ranges are NOT
     # published here — user pods are sibling containers created via the host's

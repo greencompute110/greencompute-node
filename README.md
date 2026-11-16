@@ -141,7 +141,7 @@ greencompute-node/
 │       │   ├── pod.py               # pod backend
 │       │   ├── vm.py                # firecracker stub
 │       │   └── gpu_allocator.py     # device assignment
-│       └── transport/routes.py      # /inference/<id>/v1/chat/completions proxy + /pods/<id>/stats
+│       └── transport/routes.py      # /inference/<id>/v1/chat/completions proxy + /pods/<id>/stats, exec, terminal (WebSocket)
 ├── images/diffusion/             # diffusion server image Dockerfile
 └── docker-compose.yml            # production compose for the node-agent
 ```

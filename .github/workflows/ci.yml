@@ -31,6 +31,8 @@ jobs:
         working-directory: greencompute-node
         run: uvx ruff check --select E9,F63,F7,F82 .
 
+      # fastapi + httpx: the terminal route's tests drive it with the
+      # FastAPI test client (they skip without them, so keep them here).
       - name: Unit tests
         working-directory: greencompute-node
-        run: uv run --no-project --python 3.12 --with pytest --with pydantic pytest tests -q
+        run: uv run --no-project --python 3.12 --with pytest --with pydantic --with fastapi --with httpx pytest tests -q
