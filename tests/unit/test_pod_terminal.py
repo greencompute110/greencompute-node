@@ -133,7 +133,8 @@ def test_the_wrapper_starts_a_login_shell_bash_when_there_is_one(fake_shells, sh
     try:
         out = _wrapper(fake_shells, shell, marker)
         assert out.strip().splitlines()[-1] == expected and "injected" not in out
-        assert pid_file.read_text().strip().isdigit()  # where the hang-up finds the shell
+        pid, started = pid_file.read_text().split()  # where the hang-up finds the shell: PID and start time
+        assert pid.isdigit() and started.isdigit()
     finally:
         pid_file.unlink(missing_ok=True)
 
@@ -142,13 +143,18 @@ def _hang_up(marker: str) -> None:
     subprocess.run([shutil.which("sh"), "-c", pod_terminal._HANG_UP, "sh", marker], timeout=15, check=True)
 
 
+def _start_time(pid: int) -> str:
+    """Field 22 of /proc/<pid>/stat, as the wrapper records it."""
+    return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+
+
 @needs_sh
-@pytest.mark.skipif(not all(shutil.which(c) for c in ("tr", "grep", "sleep")), reason="needs tr, grep, sleep")
+@pytest.mark.skipif(shutil.which("sleep") is None, reason="needs sleep")
 def test_the_hang_up_sends_sighup_to_the_shell_it_started():
     marker = os.urandom(12).hex()
-    shell = subprocess.Popen(["sleep", "60"], env={**os.environ, "GREENCOMPUTE_TERMINAL": marker})
+    shell = subprocess.Popen(["sleep", "60"])
     pid_file = Path(f"/tmp/.greencompute-terminal-{marker}.pid")
-    pid_file.write_text(f"{shell.pid}\n")
+    pid_file.write_text(f"{shell.pid} {_start_time(shell.pid)}\n")
     try:
         _hang_up(marker)
         assert shell.wait(timeout=5) == -1  # SIGHUP
@@ -160,24 +166,26 @@ def test_the_hang_up_sends_sighup_to_the_shell_it_started():
 
 
 @needs_sh
-@pytest.mark.skipif(not all(shutil.which(c) for c in ("tr", "grep", "sleep")), reason="needs tr, grep, sleep")
+@pytest.mark.skipif(shutil.which("sleep") is None, reason="needs sleep")
 def test_the_hang_up_kills_a_shell_that_ignores_it_and_spares_anything_else():
     marker = os.urandom(12).hex()
     # Its own process group, so its `sleep` goes with it below (in a pod, the
     # kernel hangs up the foreground job when the shell dies; not here).
-    stubborn = subprocess.Popen(["sh", "-c", "trap '' HUP; sleep 60"], start_new_session=True,
-                                env={**os.environ, "GREENCOMPUTE_TERMINAL": marker})
-    # A PID that has been reused by something else of the renter's: no marker.
+    stubborn = subprocess.Popen(["sh", "-c", "trap '' HUP; sleep 60"], start_new_session=True)
+    # A PID that has been reused by something else of the renter's: another start time.
     other = subprocess.Popen(["sleep", "60"])
     pid_file = Path(f"/tmp/.greencompute-terminal-{marker}.pid")
     try:
         time.sleep(0.2)  # let the trap be set
-        pid_file.write_text(f"{stubborn.pid}\n")
+        pid_file.write_text(f"{stubborn.pid} {_start_time(stubborn.pid)}\n")
         _hang_up(marker)
         assert stubborn.wait(timeout=5) == -9
-        pid_file.write_text(f"{other.pid}\n")
+        pid_file.write_text(f"{other.pid} {int(_start_time(other.pid)) - 1}\n")
         _hang_up(marker)
         assert other.poll() is None  # not ours: left alone
+        pid_file.write_text(f"{other.pid}\n")
+        _hang_up(marker)
+        assert other.poll() is None  # no start time: left alone
         _hang_up(marker)  # no pid file at all: nothing to do, no error
     finally:
         with contextlib.suppress(ProcessLookupError):
@@ -303,7 +311,9 @@ def test_closing_still_cleans_up_when_cancelled_part_way(local):
 
 
 @needs_sh
-def test_a_shell_that_already_ended_is_not_hung_up(local):
+def test_a_shell_that_ended_by_itself_still_has_the_pod_checked(local):
+    """docker exec can end with the pod's shell still running (its detach
+    keys, a dockerd restart); the hang-up checks, and clears the PID file."""
     state, hang_ups = local
     state["argv"] = ["sh", "-c", "exit 0"]
 
@@ -315,8 +325,9 @@ def test_a_shell_that_already_ended_is_not_hung_up(local):
                 pass
         finally:
             code = await term.close()
-        return code
-    assert run(go()) == 0 and hang_ups == []
+        return code, term.marker
+    code, marker = run(go())
+    assert code == 0 and hang_ups == [("c1", marker)]
 
 
 def test_a_busy_machine_says_so_and_a_failed_start_frees_its_slot(local, monkeypatch):

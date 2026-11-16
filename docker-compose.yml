@@ -89,10 +89,12 @@ services:
       PYTHONPATH: /app/protocol/src:/app/node/services/node-agent/src
     # websockets: uvicorn needs it to serve the pods' browser terminal
     # (/pods/<id>/terminal); without it the gateway's terminal can't connect.
+    # --ws-max-*: a terminal message is at most 1 MiB (the gateway enforces it
+    # too); uvicorn's defaults would buffer 32 x 16 MiB per socket.
     command: >
       sh -lc "apt-get update -qq && apt-get install -y -qq docker.io openssh-client >/dev/null 2>&1;
       pip install -q fastapi uvicorn websockets pydantic substrate-interface &&
-      uvicorn greencompute_node_agent.main:app --host 0.0.0.0 --port 8007"
+      uvicorn greencompute_node_agent.main:app --host 0.0.0.0 --port 8007 --ws-max-size 1048576 --ws-max-queue 4"
     # User-pod SSH (30000-31000) and custom-port (31001-32000) ranges are NOT
     # published here — user pods are sibling containers created via the host's
     # Docker socket (see `/var/run/docker.sock` mount above), so their port

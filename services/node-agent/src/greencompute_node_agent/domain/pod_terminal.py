@@ -31,7 +31,6 @@ import subprocess
 import termios
 import threading
 import time
-from contextlib import suppress
 
 MAX_TERMINALS = 8
 _SLOTS = threading.BoundedSemaphore(MAX_TERMINALS)
@@ -53,11 +52,15 @@ _CONTAINER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 
 # $1: a marker only this terminal knows (hex), $2: one of SHELLS, checked
 # before. Both are arguments, never spliced into the script. The shell's PID
-# goes to a file named after the marker so _HANG_UP can find it later (`exec`
-# keeps the PID); a pod whose /tmp can't be written still gets its terminal.
+# and start time (field 22 of /proc/<pid>/stat, after the "(name)" that may
+# hold spaces) go to a file named after the marker, so _HANG_UP finds exactly
+# this process later (`exec` keeps the PID). Shell builtins only; a pod whose
+# /tmp can't be written still gets its terminal.
 _WRAPPER = (
-    '{ echo $$ >"/tmp/.greencompute-terminal-$1.pid"; } 2>/dev/null; '
-    'case "$2" in '
+    'm=$1; want=$2; '
+    '{ read -r st </proc/$$/stat && st=${st##*) } && set -- $st && '
+    'echo "$$ ${20}" >"/tmp/.greencompute-terminal-$m.pid"; } 2>/dev/null; '
+    'case "$want" in '
     'sh) exec sh -l ;; '
     'bash) command -v bash >/dev/null 2>&1 && exec bash -l; '
     'echo "bash is not installed in this image; starting sh instead." >&2; exec sh -l ;; '
@@ -66,17 +69,21 @@ _WRAPPER = (
 )
 
 # $1: the marker. SIGHUP to the shell this terminal started, as a hung-up
-# terminal would get, then SIGKILL if it ignores that. Only a process that
-# still carries the marker in its environment: once the shell has gone, its
-# PID may belong to something else of the renter's.
+# terminal would get, then SIGKILL if it ignores that. Only while that PID is
+# still the same process (same start time, not a zombie): once the shell has
+# gone, its PID may belong to something else of the renter's. Removes the
+# PID file either way.
 _HANG_UP = (
     'f="/tmp/.greencompute-terminal-$1.pid"; '
-    'read -r p 2>/dev/null <"$f" || exit 0; rm -f "$f"; '
+    'read -r p t 2>/dev/null <"$f" || exit 0; rm -f "$f"; '
     'case "$p" in ""|*[!0-9]*) exit 0 ;; esac; '
-    'tr "\\0" "\\n" 2>/dev/null <"/proc/$p/environ" | grep -qx "GREENCOMPUTE_TERMINAL=$1" || exit 0; '
+    'case "$t" in ""|*[!0-9]*) exit 0 ;; esac; '
+    'ours() { read -r st 2>/dev/null </proc/$p/stat || return 1; st=${st##*) }; set -- $st; '
+    '[ "$1" != Z ] && [ "${20}" = "$t" ]; }; '
+    'ours || exit 0; '
     'kill -HUP "$p" 2>/dev/null || exit 0; '
-    'for _ in 1 2 3; do kill -0 "$p" 2>/dev/null || exit 0; sleep 1; done; '
-    'kill -KILL "$p" 2>/dev/null; exit 0'
+    'for _ in 1 2 3; do ours || exit 0; sleep 1; done; '
+    'ours && kill -KILL "$p" 2>/dev/null; exit 0'
 )
 
 
@@ -92,7 +99,7 @@ def clamp_size(cols: object, rows: object, *, default: tuple[int, int] = (80, 24
             return fallback
         try:
             n = int(value)  # type: ignore[call-overload]
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):  # OverflowError: JSON's Infinity
             return fallback
         return max(MIN_SIZE, min(n, top))
     return num(cols, default[0], MAX_COLS), num(rows, default[1], MAX_ROWS)
@@ -143,6 +150,7 @@ class Terminal:
         self._closed = False
         self._eof = False
         self._hung_up = False
+        self._hang_up_lock = threading.Lock()
         self.exit_code: int | None = None
 
     @property
@@ -216,41 +224,42 @@ class Terminal:
                 pass
 
     async def close(self) -> int | None:
-        """End it: hang up the shell in the pod if it is still running, kill
-        and reap the docker CLI and anything it started, free the slot.
-        Returns the shell's exit code when it had ended by itself. Safe to
-        call twice, and if the task is cancelled part way."""
+        """End it: hang up the shell in the pod, kill and reap the docker CLI
+        and anything it started, free the slot. Returns the shell's exit code
+        when it had ended by itself. Safe to call twice, and if the task is
+        cancelled part way."""
         if self._closed:
             return self.exit_code
         self._closed = True
-        proc, finished = self._proc, False
+        proc, finished, killed = self._proc, False, False
         try:
             if proc is not None:
                 # After the last output the docker CLI may take a moment to exit.
                 ended = _exited(proc.pid) or (self._eof and await self._wait_exit(KILL_GRACE_SECONDS))
-                if not ended:
-                    self._hung_up = True
-                    await asyncio.to_thread(self._hang_up)
-                    if not await self._wait_exit(KILL_GRACE_SECONDS):
-                        self._signal_group(proc.pid, signal.SIGTERM)
-                        await self._wait_exit(KILL_GRACE_SECONDS)
+                # Even when docker exec has ended, the shell in the pod may not
+                # have (its detach keys were typed, or dockerd restarted); the
+                # check in _HANG_UP makes this safe either way, and it removes
+                # the PID file.
+                await asyncio.to_thread(self._hang_up)
+                if not ended and not await self._wait_exit(KILL_GRACE_SECONDS):
+                    self._signal_group(proc.pid, signal.SIGTERM)
+                    await self._wait_exit(KILL_GRACE_SECONDS)
                 # The leader is unreaped, so the group id is still ours: this
                 # catches anything it started that outlived it.
                 self._signal_group(proc.pid, signal.SIGKILL)
+                killed = True
                 code = await asyncio.to_thread(proc.wait)
                 self.exit_code = code if ended and code >= 0 else None
             finished = True
         finally:
             if proc is not None and not finished:
                 # Cancelled part way (the server is stopping): no more waiting,
-                # but nothing left behind either. A hang-up already under way
-                # finishes in its own thread.
-                if not self._hung_up:
-                    self._hung_up = True
-                    threading.Thread(target=self._hang_up, daemon=True).start()
-                self._signal_group(proc.pid, signal.SIGKILL)
-                with suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=2)
+                # but nothing left behind either. A cancelled to_thread may
+                # never have run its hang-up; this one runs unless it did.
+                threading.Thread(target=self._hang_up, daemon=True).start()
+                if not killed:  # once killed, a reaping thread may have freed the group id
+                    self._signal_group(proc.pid, signal.SIGKILL)
+                threading.Thread(target=proc.wait, daemon=True).start()  # reap without blocking the loop
             if self._fd is not None:
                 os.close(self._fd)
                 self._fd = None
@@ -258,6 +267,10 @@ class Terminal:
         return self.exit_code
 
     def _hang_up(self) -> None:
+        with self._hang_up_lock:  # once, whichever thread gets here first
+            if self._hung_up:
+                return
+            self._hung_up = True
         try:
             subprocess.run(hang_up_argv(self.container_id, self.marker),  # noqa: S603
                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

@@ -305,7 +305,7 @@ async def pod_terminal(websocket: WebSocket, deployment_id: str) -> None:
     try:
         term = Terminal(runtime.container_id, cols=websocket.query_params.get("cols"),
                         rows=websocket.query_params.get("rows"), shell=shell)
-        term.start()
+        await asyncio.to_thread(term.start)
     except BusyError as exc:
         await _terminal_refuse(websocket, 4429, "terminal_limit", str(exc))
         return
@@ -343,20 +343,25 @@ async def _terminal_session(websocket: WebSocket, term: Any) -> None:
             if ctl.get("type") == "resize":
                 term.resize(ctl.get("cols"), ctl.get("rows"))
             elif ctl.get("type") == "input" and isinstance(ctl.get("data"), str):
-                await term.write(ctl["data"].encode())
+                await term.write(ctl["data"].encode("utf-8", "replace"))  # a lone surrogate isn't an error
             elif ctl.get("type") == "ping":
                 await websocket.send_text('{"type": "pong"}')
 
     out_task, in_task = asyncio.create_task(output()), asyncio.create_task(keystrokes())
-    done, _ = await asyncio.wait({out_task, in_task}, timeout=TERMINAL_MAX_SECONDS,
-                                 return_when=asyncio.FIRST_COMPLETED)
-    for task in (out_task, in_task):
-        task.cancel()
-    await asyncio.gather(out_task, in_task, return_exceptions=True)
+    try:
+        done, _ = await asyncio.wait({out_task, in_task}, timeout=TERMINAL_MAX_SECONDS,
+                                     return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        # Cancel both and let them finish (asyncio.wait: a cancelled gather
+        # can escape the server's cancel scope as a stray CancelledError).
+        for task in (out_task, in_task):
+            task.cancel()
+        await asyncio.wait({out_task, in_task})
+    failed = {t: t.exception() for t in (out_task, in_task) if not t.cancelled()}  # retrieved: not logged
     if in_task in done:
         return  # the gateway hung up: nobody to tell
     if out_task in done:
-        if out_task.exception() is not None:
+        if failed.get(out_task) is not None:
             return  # the gateway's socket broke mid-send
         code = await term.close()  # the shell ended by itself: say how
         message, close_code = {"type": "exit", "code": code}, 1000
