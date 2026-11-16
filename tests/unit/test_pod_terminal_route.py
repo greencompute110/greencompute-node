@@ -2,6 +2,7 @@
 only for running pods, nothing but a lookup for the deployment id, and the
 session's messages (ready, output, resize, ping, exit). `docker exec` is
 swapped for a local shell."""
+import asyncio
 import json
 import shutil
 import time
@@ -186,3 +187,86 @@ def test_a_busy_machine_refuses_with_a_code(node):
     finally:
         for _ in taken:
             pod_terminal._SLOTS.release()
+
+
+class StuckTerminal:
+    """A pod that never reads its input and prints nothing (`exec sleep
+    infinity`): write() and read() never return."""
+
+    instances: list = []
+
+    def __init__(self, container_id, *, cols=80, rows=24, shell="auto"):
+        self.cols, self.rows = cols, rows
+        self.written: list[bytes] = []
+        self.resizes: list[tuple] = []
+        self.closed = False
+        StuckTerminal.instances.append(self)
+
+    def start(self):
+        pass
+
+    async def read(self):
+        await asyncio.Event().wait()
+
+    async def write(self, data):
+        self.written.append(data)
+        await asyncio.Event().wait()
+
+    def resize(self, cols, rows):
+        self.resizes.append((cols, rows))
+
+    async def close(self):
+        self.closed = True
+        return None
+
+
+@pytest.fixture
+def stuck(node, monkeypatch):
+    StuckTerminal.instances = []
+    monkeypatch.setattr(pod_terminal, "Terminal", StuckTerminal)
+    monkeypatch.setattr(routes, "TERMINAL_INPUT_BUFFER_BYTES", 4096)
+    return node[0]
+
+
+def _until(check, seconds=5.0):
+    deadline = time.monotonic() + seconds
+    while not check():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
+def test_a_hang_up_is_noticed_while_the_pod_reads_no_input(stuck):
+    with stuck.websocket_connect("/pods/pod-1/terminal", headers={"X-Agent-Auth": SECRET}) as ws:
+        assert json.loads(ws.receive_text())["type"] == "ready"
+        for _ in range(20):  # far past what the pod would take: the sender must never wait on it
+            ws.send_bytes(b"x" * 1000)
+    term = StuckTerminal.instances[0]
+    assert _until(lambda: term.closed), "the session outlived the gateway hanging up"
+
+
+def test_input_past_the_buffer_is_dropped_whole_with_one_notice(stuck):
+    with stuck.websocket_connect("/pods/pod-1/terminal", headers={"X-Agent-Auth": SECRET}) as ws:
+        assert json.loads(ws.receive_text())["type"] == "ready"
+        ws.send_bytes(b"a" * 3000)
+        ws.send_bytes(b"b" * 3000)  # 6000 > 4096: dropped, all of it
+        notice = json.loads(ws.receive_text())
+        assert (notice["type"], notice["code"]) == ("notice", "input_dropped")
+        ws.send_text(json.dumps({"type": "input", "data": "c" * 3000}))  # still stuck: dropped, no second notice
+        ws.send_text(json.dumps({"type": "ping"}))
+        assert json.loads(ws.receive_text()) == {"type": "pong"}
+    term = StuckTerminal.instances[0]
+    assert term.written == [b"a" * 3000]
+    assert _until(lambda: term.closed)
+
+
+def test_a_burst_of_resizes_reaches_the_pod_a_few_times_ending_with_the_last(stuck):
+    with stuck.websocket_connect("/pods/pod-1/terminal", headers={"X-Agent-Auth": SECRET}) as ws:
+        assert json.loads(ws.receive_text())["type"] == "ready"
+        for n in range(200):
+            ws.send_text(json.dumps({"type": "resize", "cols": 80 + n % 50, "rows": 24}))
+        ws.send_text(json.dumps({"type": "resize", "cols": 99, "rows": 33}))
+        term = StuckTerminal.instances[0]
+        assert _until(lambda: term.resizes and term.resizes[-1] == (99, 33))
+        assert len(term.resizes) <= 10, term.resizes

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections import deque
 from contextlib import suppress
 from typing import Any
 from urllib import request as urllib_request
@@ -261,6 +262,17 @@ def pod_stats(
 #: Hard stop for one terminal, over the gateway's own 4-hour limit: if the
 #: gateway lost track of a session, this machine still ends it.
 TERMINAL_MAX_SECONDS = 5 * 3600
+#: Keystrokes waiting for the pod to read them. Past this, new input is
+#: dropped (with a notice) rather than waited for: the socket is always read,
+#: so a hang-up is noticed even while the program in the pod reads nothing.
+TERMINAL_INPUT_BUFFER_BYTES = 1024 * 1024
+#: At most this many size changes a second reach the pod (each one is a call
+#: to the docker daemon every renter on the machine shares).
+TERMINAL_RESIZES_PER_SECOND = 10
+_INPUT_DROPPED = json.dumps({
+    "type": "notice", "code": "input_dropped",
+    "message": "The program in your terminal isn't reading input, so some of what you typed or pasted was "
+               "dropped. Press Ctrl-C to stop it, or wait for it to finish."})
 
 
 async def _terminal_refuse(websocket: WebSocket, close_code: int, code: str, message: str) -> None:
@@ -322,17 +334,56 @@ async def pod_terminal(websocket: WebSocket, deployment_id: str) -> None:
 
 
 async def _terminal_session(websocket: WebSocket, term: Any) -> None:
+    pending: deque[bytes] = deque()  # input not yet written to the terminal
+    queued = 0  # its bytes, including the chunk being written
+    has_input, has_resize = asyncio.Event(), asyncio.Event()
+    size: list[Any] = [None, None]
+    warned = False  # an input_dropped notice since the input last caught up
+
     async def output() -> None:
         while chunk := await term.read():
             await websocket.send_bytes(chunk)
 
+    async def feed() -> None:
+        """Writes queued input at the speed the pod reads it."""
+        nonlocal queued, warned
+        while True:
+            await has_input.wait()
+            while pending:
+                chunk = pending[0]
+                await term.write(chunk)
+                pending.popleft()
+                queued -= len(chunk)
+            has_input.clear()  # no await since `pending` emptied: nothing slipped in
+            warned = False
+
+    async def resizer() -> None:
+        while True:
+            await has_resize.wait()
+            has_resize.clear()
+            term.resize(*size)
+            await asyncio.sleep(1 / TERMINAL_RESIZES_PER_SECOND)  # later ones in this gap: only the last counts
+
     async def keystrokes() -> None:
+        async def put(data: bytes) -> None:
+            nonlocal queued, warned
+            if not data:
+                return
+            if queued + len(data) > TERMINAL_INPUT_BUFFER_BYTES:
+                if not warned:
+                    warned = True
+                    await websocket.send_text(_INPUT_DROPPED)
+                return  # the whole message, never part of one: no cut-off command runs
+            pending.append(data)
+            queued += len(data)
+            has_input.set()
+
         while True:
             msg = await websocket.receive()
             if msg["type"] == "websocket.disconnect":
                 return
             if msg.get("bytes") is not None:
-                await term.write(msg["bytes"])
+                await put(msg["bytes"])
                 continue
             try:
                 ctl = json.loads(msg.get("text") or "")
@@ -341,23 +392,28 @@ async def _terminal_session(websocket: WebSocket, term: Any) -> None:
             if not isinstance(ctl, dict):
                 continue
             if ctl.get("type") == "resize":
-                term.resize(ctl.get("cols"), ctl.get("rows"))
+                size[:] = [ctl.get("cols"), ctl.get("rows")]
+                has_resize.set()
             elif ctl.get("type") == "input" and isinstance(ctl.get("data"), str):
-                await term.write(ctl["data"].encode("utf-8", "replace"))  # a lone surrogate isn't an error
+                await put(ctl["data"].encode("utf-8", "replace"))  # a lone surrogate isn't an error
             elif ctl.get("type") == "ping":
                 await websocket.send_text('{"type": "pong"}')
 
     out_task, in_task = asyncio.create_task(output()), asyncio.create_task(keystrokes())
+    helpers = {asyncio.create_task(feed()), asyncio.create_task(resizer())}
     try:
-        done, _ = await asyncio.wait({out_task, in_task}, timeout=TERMINAL_MAX_SECONDS,
+        done, _ = await asyncio.wait({out_task, in_task, *helpers}, timeout=TERMINAL_MAX_SECONDS,
                                      return_when=asyncio.FIRST_COMPLETED)
     finally:
-        # Cancel both and let them finish (asyncio.wait: a cancelled gather
-        # can escape the server's cancel scope as a stray CancelledError).
-        for task in (out_task, in_task):
+        # Cancel them all and let them finish (asyncio.wait: a cancelled
+        # gather can escape the server's cancel scope as a stray CancelledError).
+        everything = {out_task, in_task, *helpers}
+        for task in everything:
             task.cancel()
-        await asyncio.wait({out_task, in_task})
-    failed = {t: t.exception() for t in (out_task, in_task) if not t.cancelled()}  # retrieved: not logged
+        await asyncio.wait(everything)
+    failed = {t: t.exception() for t in (out_task, in_task, *helpers) if not t.cancelled()}  # retrieved: not logged
+    if done & helpers:
+        return  # writing to or resizing the terminal failed: it is closed below
     if in_task in done:
         return  # the gateway hung up: nobody to tell
     if out_task in done:

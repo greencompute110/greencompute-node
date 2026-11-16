@@ -210,7 +210,10 @@ class Terminal:
                 return
 
     def resize(self, cols: object, rows: object) -> None:
-        self.cols, self.rows = clamp_size(cols, rows, default=(self.cols, self.rows))
+        size = clamp_size(cols, rows, default=(self.cols, self.rows))
+        if size == (self.cols, self.rows):
+            return  # nothing changed: no call to the docker daemon
+        self.cols, self.rows = size
         if self._fd is None or self._proc is None:
             return
         _set_size(self._fd, self.cols, self.rows)
