@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
+from contextlib import suppress
 from typing import Any
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request, WebSocket
 from fastapi.responses import StreamingResponse
 
 from greencompute_protocol import (
@@ -20,6 +24,7 @@ from greencompute_node_agent.transport.redaction import redact
 from greencompute_node_agent.transport.security import validate_auth
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # Service instance — set by main.py during app startup
 _service = None
@@ -251,6 +256,116 @@ def pod_stats(
         gpu_device_ids=gpu_device_ids,
         workspace_path="/workspace",
     )
+
+
+#: Hard stop for one terminal, over the gateway's own 4-hour limit: if the
+#: gateway lost track of a session, this machine still ends it.
+TERMINAL_MAX_SECONDS = 5 * 3600
+
+
+async def _terminal_refuse(websocket: WebSocket, close_code: int, code: str, message: str) -> None:
+    """Tell the gateway why (an `error` message, then a 4xxx close code)."""
+    with suppress(Exception):
+        await websocket.accept()
+        await websocket.send_text(json.dumps({"type": "error", "code": code, "message": message}))
+        await websocket.close(code=close_code, reason=code)
+
+
+@router.websocket("/pods/{deployment_id}/terminal")
+async def pod_terminal(websocket: WebSocket, deployment_id: str) -> None:
+    """An interactive root shell in the pod, from /workspace, for the
+    website's terminal (relayed by the gateway). Only with the node secret
+    (sensitive), only in running pods. Query: cols, rows, shell (auto, bash
+    or sh). Binary frames are terminal bytes both ways; text frames are JSON:
+    in, {"type": "resize", "cols", "rows"}, {"type": "input", "data"} and
+    {"type": "ping"}; out, {"type": "ready"}, {"type": "exit", "code"},
+    {"type": "error", "code", "message"} and {"type": "pong"}."""
+    try:
+        validate_auth(websocket.headers.get("x-agent-auth"), _cfg(), sensitive=True)
+    except HTTPException:
+        # Before accepting: the handshake itself is refused (HTTP 403).
+        await websocket.close(code=4401)
+        return
+    from greencompute_node_agent.domain.pod_terminal import SHELLS, BusyError, Terminal
+
+    shell = websocket.query_params.get("shell") or "auto"
+    if shell not in SHELLS:
+        await _terminal_refuse(websocket, 4400, "invalid_request", f"shell must be one of {', '.join(SHELLS)}")
+        return
+    runtime = await asyncio.to_thread(_svc().repository.get_runtime, deployment_id)
+    if runtime is None:
+        await _terminal_refuse(websocket, 4404, "not_found", "no such pod on this machine")
+        return
+    if runtime.workload_kind not in ("pod", WorkloadKind.POD):
+        await _terminal_refuse(websocket, 4409, "conflict", "terminals open only in rentals (pods)")
+        return
+    if runtime.status != "ready" or not runtime.container_id:
+        await _terminal_refuse(websocket, 4409, "conflict", "the pod isn't running")
+        return
+    try:
+        term = Terminal(runtime.container_id, cols=websocket.query_params.get("cols"),
+                        rows=websocket.query_params.get("rows"), shell=shell)
+        term.start()
+    except BusyError as exc:
+        await _terminal_refuse(websocket, 4429, "terminal_limit", str(exc))
+        return
+    except (OSError, ValueError):
+        logger.exception("terminal: couldn't start one in %s", deployment_id)
+        await _terminal_refuse(websocket, 4503, "unavailable", "couldn't start a shell in the pod")
+        return
+    try:
+        await websocket.accept()
+        await websocket.send_text(json.dumps({"type": "ready"}))
+        await _terminal_session(websocket, term)
+    finally:
+        await term.close()
+
+
+async def _terminal_session(websocket: WebSocket, term: Any) -> None:
+    async def output() -> None:
+        while chunk := await term.read():
+            await websocket.send_bytes(chunk)
+
+    async def keystrokes() -> None:
+        while True:
+            msg = await websocket.receive()
+            if msg["type"] == "websocket.disconnect":
+                return
+            if msg.get("bytes") is not None:
+                await term.write(msg["bytes"])
+                continue
+            try:
+                ctl = json.loads(msg.get("text") or "")
+            except ValueError:
+                continue
+            if not isinstance(ctl, dict):
+                continue
+            if ctl.get("type") == "resize":
+                term.resize(ctl.get("cols"), ctl.get("rows"))
+            elif ctl.get("type") == "input" and isinstance(ctl.get("data"), str):
+                await term.write(ctl["data"].encode())
+            elif ctl.get("type") == "ping":
+                await websocket.send_text('{"type": "pong"}')
+
+    out_task, in_task = asyncio.create_task(output()), asyncio.create_task(keystrokes())
+    done, _ = await asyncio.wait({out_task, in_task}, timeout=TERMINAL_MAX_SECONDS,
+                                 return_when=asyncio.FIRST_COMPLETED)
+    for task in (out_task, in_task):
+        task.cancel()
+    await asyncio.gather(out_task, in_task, return_exceptions=True)
+    if in_task in done:
+        return  # the gateway hung up: nobody to tell
+    if out_task in done:
+        if out_task.exception() is not None:
+            return  # the gateway's socket broke mid-send
+        code = await term.close()  # the shell ended by itself: say how
+        message, close_code = {"type": "exit", "code": code}, 1000
+    else:
+        message = {"type": "error", "code": "terminal_session_limit", "message": "the terminal reached its time limit"}
+        close_code = 4410
+    with suppress(Exception):
+        await websocket.send_text(json.dumps(message))
+        await websocket.close(code=close_code)
 
 
 @router.post("/inference/{deployment_id}/v1/chat/completions")
